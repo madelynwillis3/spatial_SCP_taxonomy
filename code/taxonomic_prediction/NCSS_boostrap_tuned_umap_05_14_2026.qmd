@@ -1,0 +1,375 @@
+---
+title: "NCSS_boostrap_tuned_umap_05_14_2026"
+format: html
+---
+```{r}
+# =============================================================================
+# NCSS_bootstrap_tuned_umap.R
+#
+# Re-runs the 10-replicate bootstrap using tuned UMAP+HDBSCAN settings
+# from the sensitivity analysis. Plain variants are unaffected.
+#
+# Workflow:
+#   1. Load tuned UMAP settings (best per outcome × engine from sensitivity)
+#   2. For each outcome × umap_hdb variant × replicate:
+#        - Use the tuned UMAP hyperparameters
+#        - Run inner-CV tuning of downstream RF/XGB classifier (unchanged)
+#        - Score on the held-out test split
+#        - Save bundle
+#   3. Pick canonical bundles (replicate closest to median kappa)
+#
+# Output: same structure as your existing bootstrap, with bundles named
+#         "{outcome}_{engine}_umap_hdb_tuned" to distinguish from default UMAP.
+# =============================================================================
+
+library(tidyverse)
+library(here)
+library(beepr)
+
+source(here("code", "modeling_functions_05_02_2026.R"))
+source(here("code", "pedon_pack_functions_05_02_2026.R"))
+
+dir.create(here("outputs", "models_05_02"),  showWarnings = FALSE, recursive = TRUE)
+dir.create(here("outputs", "reports_05_02"), showWarnings = FALSE, recursive = TRUE)
+
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+N_REPLICATES <- 10
+INNER_V      <- 5
+GRID_SIZE    <- 12
+
+MIN_N_MAP <- c(
+  taxorder        = 15,
+  taxsuborder     = 15,
+  taxgrtgroup     = 15,
+  taxsubgrp_mod1  = 12,
+  taxpartsize     = 20,
+  taxonname_clean = 15
+)
+
+OUTCOMES <- c("taxorder", "taxsuborder", "taxgrtgroup",
+              "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+
+# -----------------------------------------------------------------------------
+# LOAD TUNED UMAP SETTINGS FROM SENSITIVITY ANALYSIS
+# -----------------------------------------------------------------------------
+# Combine part1 (great group + subgroup) and part2 (others)
+sens_part1_path <- here("outputs", "reports_05_02",
+                         "umap_sensitivity_results_part1_gg_subgrp.csv")
+sens_part2_path <- here("outputs", "reports_05_02",
+                         "umap_sensitivity_results_part2_others.csv")
+
+if (file.exists(sens_part1_path) && file.exists(sens_part2_path)) {
+  sens_full <- bind_rows(
+    read.csv(sens_part1_path),
+    read.csv(sens_part2_path)
+  )
+} else if (file.exists(here("outputs", "reports_05_02",
+                             "umap_sensitivity_results_FULL.csv"))) {
+  sens_full <- read.csv(here("outputs", "reports_05_02",
+                              "umap_sensitivity_results_FULL.csv"))
+} else if (file.exists(here("outputs", "reports_05_02",
+                             "umap_sensitivity_results.csv"))) {
+  sens_full <- read.csv(here("outputs", "reports_05_02",
+                              "umap_sensitivity_results.csv"))
+} else {
+  stop("Cannot find sensitivity analysis results. ",
+       "Expected one of: umap_sensitivity_results_FULL.csv, ",
+       "umap_sensitivity_results_part1_gg_subgrp.csv + part2, ",
+       "or umap_sensitivity_results.csv")
+}
+
+# Best UMAP config per (outcome × engine) by NCSS kappa
+best_umap_settings <- sens_full %>%
+  filter(status == "ok") %>%
+  group_by(outcome, engine) %>%
+  slice_max(ncss_kap, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(outcome, engine, n_neighbors, min_dist, minPts,
+         tuned_ncss_kap = ncss_kap, tuned_perry_kap = perry_kap)
+
+cat("\n========================================\n")
+cat("BEST UMAP SETTINGS (loaded from sensitivity)\n")
+cat("========================================\n")
+print(best_umap_settings, n = Inf)
+
+write.csv(best_umap_settings,
+          here("outputs", "reports_05_02", "best_umap_settings.csv"),
+          row.names = FALSE)
+
+# Helper: look up tuned settings for a given outcome × engine
+get_tuned_umap_settings <- function(outcome, engine,
+                                     settings_df = best_umap_settings) {
+  row <- settings_df %>%
+    filter(outcome == !!outcome, engine == !!engine)
+
+  if (nrow(row) == 0) {
+    warning("No tuned settings found for ", outcome, " × ", engine,
+            ". Falling back to defaults.")
+    return(list(
+      n_components = 10,
+      n_neighbors  = 15,
+      min_dist     = 0.1,
+      metric       = "euclidean",
+      minPts       = 10
+    ))
+  }
+
+  list(
+    n_components = 10,
+    n_neighbors  = row$n_neighbors,
+    min_dist     = row$min_dist,
+    metric       = "euclidean",
+    minPts       = row$minPts
+  )
+}
+
+# -----------------------------------------------------------------------------
+# LOAD DATA
+# -----------------------------------------------------------------------------
+ncss_pack_files <- list.files(here("outputs"),
+                               pattern = "^pedon_pack_150_.*\\.csv$",
+                               full.names = TRUE)
+ncss_pack_path <- ncss_pack_files[which.max(file.mtime(ncss_pack_files))]
+cat("Loading:", basename(ncss_pack_path), "\n")
+
+pedon_pack_150 <- read.csv(ncss_pack_path) %>%
+  mutate(peiid = as.character(peiid))
+
+cat("Pedons loaded:", nrow(pedon_pack_150), "\n")
+
+# -----------------------------------------------------------------------------
+# PREP DATA PER OUTCOME
+# -----------------------------------------------------------------------------
+prepped_data <- map(OUTCOMES, function(oc) {
+  df <- pedon_pack_150 %>%
+    select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))) %>%
+    prep_outcome(oc, min_n = MIN_N_MAP[[oc]])
+  list(outcome = oc, df = df, n = nrow(df),
+       n_class = nlevels(df[[oc]]))
+}) %>% set_names(OUTCOMES)
+
+cat("\n--- Modeling data per outcome ---\n")
+walk(prepped_data, ~ cat(.x$outcome, ": n =", .x$n,
+                          "| classes =", .x$n_class, "\n"))
+
+# -----------------------------------------------------------------------------
+# TUNED-UMAP BOOTSTRAP LOOP
+# Only umap_hdb variants — plain bundles already exist and are unchanged.
+# -----------------------------------------------------------------------------
+TUNED_VARIANTS <- tribble(
+  ~engine, ~space,
+  "rf",    "umap_hdb",
+  "xgb",   "umap_hdb"
+)
+
+cat("\n========================================\n")
+cat("TUNED-UMAP BOOTSTRAP:", N_REPLICATES, "replicates × 2 engines × 6 outcomes\n")
+cat("========================================\n")
+
+all_test_metrics_tuned <- list()
+
+for (rep in seq_len(N_REPLICATES)) {
+
+  cat("\n>>> REPLICATE", rep, "of", N_REPLICATES, "\n")
+
+  # Same seeding scheme as your original bootstrap
+  set.seed(2026 + rep * 1000)
+  splits_rep <- map(prepped_data, function(p) {
+    s <- initial_split(p$df, prop = 0.8, strata = !!sym(p$outcome))
+    list(train = training(s), test = testing(s))
+  })
+
+  metrics_this_rep <- list()
+
+  for (oc in OUTCOMES) {
+    s <- splits_rep[[oc]]
+
+    for (i in seq_len(nrow(TUNED_VARIANTS))) {
+      eng <- TUNED_VARIANTS$engine[i]
+      sp  <- TUNED_VARIANTS$space[i]
+
+      # Bundle name: "_tuned" suffix distinguishes from default-UMAP bundles
+      bundle_name <- paste(oc, eng, sp, "tuned", sep = "_")
+      rep_bundle_name <- paste0(bundle_name, "_rep", sprintf("%02d", rep))
+
+      # Get tuned UMAP settings for this outcome × engine
+      tuned_settings <- get_tuned_umap_settings(oc, eng)
+
+      cat("  -- rep", rep, "|", bundle_name,
+          "(nn=", tuned_settings$n_neighbors,
+          " md=", tuned_settings$min_dist,
+          " mpts=", tuned_settings$minPts, ") ...")
+      t0 <- Sys.time()
+
+      res <- tryCatch(
+        fit_one_model(
+          train_df = s$train %>% select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))),
+          test_df  = s$test  %>% select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))),
+          outcome  = oc, engine = eng, space = sp,
+          inner_v  = INNER_V, grid_size = GRID_SIZE,
+          seed     = 200 + i + rep * 1000,
+          umap_settings = tuned_settings
+        ),
+        error = function(e) {
+          cat(" ERROR:", e$message, "\n")
+          NULL
+        }
+      )
+
+      if (is.null(res)) next
+
+      eval_metrics <- evaluate_predictions(
+        res$pred, truth_col = oc,
+        k_for_topk = if (oc == "taxonname_clean") 5 else 3
+      ) %>%
+        mutate(outcome = oc, engine = eng, space = sp,
+               bundle_name = bundle_name, replicate = rep)
+
+      metrics_this_rep[[bundle_name]] <- eval_metrics
+
+      # Save UMAP fit alongside bundle
+      umap_path <- paste0(here("outputs", "models_05_02"),
+                          "/", rep_bundle_name, "_umap.uwot")
+      uwot::save_uwot(res$umap_fit, file = umap_path)
+
+      bundle <- build_umap_hdb_bundle(
+        name = bundle_name, outcome = oc,
+        train_raw = res$train_raw,
+        prep_rec  = res$prep_rec,
+        final_fit = res$final_fit,
+        umap_model_file = umap_path,
+        hdb_fit = res$hdb_fit, z_train = res$z_train,
+        umap_settings = tuned_settings
+      )
+
+      bundle$test_metrics <- eval_metrics
+      bundle$replicate <- rep
+      bundle$tuned <- TRUE
+      bundle$conf_mat <- conf_mat(
+        res$pred %>% rename(.truth = all_of(oc)),
+        truth = .truth, estimate = .pred_class
+      )
+
+      saveRDS(bundle,
+              paste0(here("outputs", "models_05_02"),
+                     "/", rep_bundle_name, "_bundle.rds"))
+
+      dt <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1)
+      cat(" done in", dt, "min | kap =", round(eval_metrics$kap, 3), "\n")
+    }
+  }
+
+  all_test_metrics_tuned[[rep]] <- bind_rows(metrics_this_rep)
+  beep("ping")
+}
+
+# Combine all metrics
+test_metrics_tuned <- bind_rows(all_test_metrics_tuned)
+
+write.csv(test_metrics_tuned,
+          here("outputs", "reports_05_02",
+               "test_metrics_all_reps_tuned_ncss.csv"),
+          row.names = FALSE)
+
+cat("\n========================================\n")
+cat("BOOTSTRAP COMPLETE\n")
+cat("========================================\n")
+
+# -----------------------------------------------------------------------------
+# SUMMARIZE + PICK CANONICAL TUNED BUNDLES (replicate closest to median kap)
+# -----------------------------------------------------------------------------
+test_metrics_tuned_summary <- test_metrics_tuned %>%
+  group_by(outcome, engine, space, bundle_name) %>%
+  summarise(
+    n_replicates    = n(),
+    kap_mean        = mean(kap,        na.rm = TRUE),
+    kap_sd          = sd(kap,          na.rm = TRUE),
+    kap_median      = median(kap,      na.rm = TRUE),
+    kap_lo_95       = quantile(kap, 0.025, na.rm = TRUE),
+    kap_hi_95       = quantile(kap, 0.975, na.rm = TRUE),
+    accuracy_median = median(accuracy, na.rm = TRUE),
+    bal_acc_median  = median(bal_accuracy, na.rm = TRUE),
+    f_meas_median   = median(f_meas_macro, na.rm = TRUE),
+    top_k_median    = median(top_k,    na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(test_metrics_tuned_summary, n = Inf)
+
+write.csv(test_metrics_tuned_summary,
+          here("outputs", "reports_05_02",
+               "test_metrics_summary_tuned_ncss.csv"),
+          row.names = FALSE)
+
+# Pick canonical replicate for each tuned bundle
+canonical_picks_tuned <- test_metrics_tuned %>%
+  left_join(
+    test_metrics_tuned_summary %>% select(outcome, engine, space, kap_median),
+    by = c("outcome", "engine", "space")
+  ) %>%
+  mutate(dist_to_median = abs(kap - kap_median)) %>%
+  group_by(outcome, engine, space, bundle_name) %>%
+  slice_min(dist_to_median, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(outcome, engine, space, bundle_name, replicate,
+         kap, kap_median, dist_to_median)
+
+cat("\n--- Canonical tuned bundle per outcome × engine ---\n")
+print(canonical_picks_tuned)
+
+write.csv(canonical_picks_tuned,
+          here("outputs", "reports_05_02",
+               "canonical_replicate_picks_tuned.csv"),
+          row.names = FALSE)
+
+# Copy canonical replicate's bundle to its canonical filename
+cat("\nCopying canonical tuned bundles...\n")
+for (i in seq_len(nrow(canonical_picks_tuned))) {
+  pick <- canonical_picks_tuned[i, ]
+  rep  <- pick$replicate
+  bn   <- pick$bundle_name
+
+  src_bundle <- paste0(here("outputs", "models_05_02"),
+                       "/", bn, "_rep", sprintf("%02d", rep), "_bundle.rds")
+  dst_bundle <- paste0(here("outputs", "models_05_02"),
+                       "/", bn, "_bundle.rds")
+
+  if (!file.exists(src_bundle)) {
+    cat("  WARNING: missing", src_bundle, "\n")
+    next
+  }
+
+  b <- readRDS(src_bundle)
+  b$repeated_split_summary <- test_metrics_tuned_summary %>%
+    filter(bundle_name == bn) %>%
+    as.list()
+  saveRDS(b, dst_bundle)
+
+  src_umap <- paste0(here("outputs", "models_05_02"),
+                     "/", bn, "_rep", sprintf("%02d", rep), "_umap.uwot")
+  dst_umap <- paste0(here("outputs", "models_05_02"),
+                     "/", bn, "_umap.uwot")
+  if (file.exists(src_umap)) {
+    file.copy(src_umap, dst_umap, overwrite = TRUE)
+  }
+
+  cat("  ", bn, "(rep", rep, ", kap =", round(pick$kap, 3), ")\n")
+}
+
+cat("\n========================================\n")
+cat("DONE.\n")
+cat("Tuned UMAP bundles saved to outputs/models_05_02/\n")
+cat("- Canonical bundles: {outcome}_{engine}_umap_hdb_tuned_bundle.rds\n")
+cat("- Replicate bundles: {outcome}_{engine}_umap_hdb_tuned_repNN_bundle.rds\n")
+cat("- Summary CSV: test_metrics_summary_tuned_ncss.csv\n")
+cat("========================================\n")
+cat("\nNext step: re-run Perry_model_boostrap_05_12_2026.qmd to deploy\n")
+cat("the new tuned bundles to Perry. The Perry script picks up all\n")
+cat("bundles matching '*_bundle.rds' so tuned bundles will be included\n")
+cat("automatically alongside plain and default-UMAP bundles.\n")
+
+beep("complete")
+```
+

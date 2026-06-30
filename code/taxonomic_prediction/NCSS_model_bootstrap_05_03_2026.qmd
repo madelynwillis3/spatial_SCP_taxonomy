@@ -1,0 +1,1882 @@
+---
+title: "NCSS_model_05_02_2026"
+format: html
+---
+
+
+```{r setup}
+library(beepr)
+source("../code/modeling_functions_05_02_2026.R")
+source("../code/pedon_pack_functions_05_02_2026.R")  # for `%||%` and helpers
+
+dir.create("../outputs/models_05_02",  showWarnings = FALSE, recursive = TRUE)
+dir.create("../outputs/reports_05_02", showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r config}
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Set to TRUE to skip nested CV and only fit final production bundles.
+# Useful for fast iteration; set to FALSE for thesis-grade reporting.
+FAST_MODE <- FALSE
+
+# Outer/inner fold counts for nested CV
+OUTER_V <- 5
+INNER_V <- 5
+GRID_SIZE <- 12   # hyperparameters per inner-fold tune (latin hypercube for XGB)
+
+# Min-class-size thresholds (raised for nested-CV stability;
+# series uses two thresholds — see prep-outcomes chunk).
+MIN_N_MAP <- c(
+  taxorder        = 15,
+  taxsuborder     = 15,
+  taxgrtgroup     = 15,
+  taxsubgrp_mod1  = 12,   # was 20 — rescues Rhodic, Aeric
+  taxpartsize     = 20,
+  taxonname_clean = 15    # nested-CV; deployment uses min_n=5
+)
+# Variants to fit per outcome
+MODEL_VARIANTS <- tribble(
+  ~engine, ~space,
+  "rf",    "plain",
+  "xgb",   "plain",
+  "rf",    "umap_hdb",
+  "xgb",   "umap_hdb"
+)
+
+# Outcomes to model (ordered: easy -> hard)
+OUTCOMES <- c("taxorder", "taxsuborder", "taxgrtgroup",
+              "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+
+
+```
+
+```{r load-data}
+# ============================================================
+# LOAD DATA
+# ============================================================
+ncss_pack_files <- list.files("../outputs",
+                              pattern = "^pedon_pack_150_.*\\.csv$",
+                              full.names = TRUE)
+ncss_pack_path <- ncss_pack_files[which.max(file.mtime(ncss_pack_files))]
+cat("Loading:", ncss_pack_path, "\n")
+
+pedon_pack_150 <- read.csv(ncss_pack_path) %>%
+  mutate(peiid = as.character(peiid))
+
+cat("Pedons loaded:", nrow(pedon_pack_150), "\n")
+cat("Columns:",       ncol(pedon_pack_150), "\n")
+```
+
+```{r class-coverage-report}
+# ============================================================
+# CLASS-COVERAGE REPORT
+# Runs BEFORE any modeling. Documents what survives each
+# threshold and what gets dropped.
+# ============================================================
+
+class_coverage_report <- function(df, outcome, min_n) {
+  total_pedons  <- sum(!is.na(df[[outcome]]))
+  class_counts  <- df %>%
+    filter(!is.na(.data[[outcome]])) %>%
+    count(.data[[outcome]], name = "n_pedons", sort = TRUE)
+
+  kept    <- class_counts %>% filter(n_pedons >= min_n)
+  dropped <- class_counts %>% filter(n_pedons <  min_n)
+
+  list(
+    outcome      = outcome,
+    min_n        = min_n,
+    total_pedons = total_pedons,
+    total_classes = nrow(class_counts),
+    kept_classes  = nrow(kept),
+    kept_pedons   = sum(kept$n_pedons),
+    dropped_classes = nrow(dropped),
+    dropped_pedons  = sum(dropped$n_pedons),
+    coverage_pct  = round(100 * sum(kept$n_pedons) / total_pedons, 1),
+    kept_table    = kept,
+    dropped_table = dropped
+  )
+}
+
+coverage_reports <- map(
+  OUTCOMES,
+  ~ class_coverage_report(pedon_pack_150, .x, MIN_N_MAP[[.x]])
+) %>% set_names(OUTCOMES)
+
+# ---- Summary table (thesis-ready) ----
+coverage_summary <- map_dfr(coverage_reports, function(r) {
+  tibble(
+    outcome           = r$outcome,
+    threshold_min_n   = r$min_n,
+    total_classes     = r$total_classes,
+    kept_classes      = r$kept_classes,
+    dropped_classes   = r$dropped_classes,
+    total_pedons      = r$total_pedons,
+    kept_pedons       = r$kept_pedons,
+    dropped_pedons    = r$dropped_pedons,
+    coverage_pct      = r$coverage_pct
+  )
+})
+
+cat("\n========================================\n")
+cat("CLASS COVERAGE SUMMARY (NCSS)\n")
+cat("========================================\n")
+print(coverage_summary)
+
+# ---- Per-outcome detail: which classes were dropped? ----
+for (oc in OUTCOMES) {
+  r <- coverage_reports[[oc]]
+  cat("\n--- ", oc, " (min_n = ", r$min_n, ") ---\n", sep = "")
+  cat("KEPT (", r$kept_classes, " classes, ", r$kept_pedons, " pedons):\n", sep = "")
+  print(r$kept_table)
+  if (nrow(r$dropped_table) > 0) {
+    cat("\nDROPPED (", r$dropped_classes, " classes, ",
+        r$dropped_pedons, " pedons):\n", sep = "")
+    print(r$dropped_table)
+  } else {
+    cat("\nDROPPED: none\n")
+  }
+}
+
+# ---- Save ----
+write.csv(coverage_summary,
+          "../outputs/reports_05_02/class_coverage_summary_ncss.csv",
+          row.names = FALSE)
+
+# Per-outcome dropped classes (long format, for thesis appendix)
+dropped_long <- map_dfr(coverage_reports, function(r) {
+  if (nrow(r$dropped_table) == 0) return(NULL)
+  r$dropped_table %>%
+    mutate(outcome = r$outcome, threshold_min_n = r$min_n) %>%
+    rename(class = !!sym(r$outcome)) %>%
+    select(outcome, threshold_min_n, class, n_pedons)
+})
+
+write.csv(dropped_long,
+          "../outputs/reports_05_02/dropped_classes_ncss.csv",
+          row.names = FALSE)
+
+cat("\nCoverage reports saved to ../outputs/reports_05_02/\n")
+```
+
+```{r prep-outcomes}
+# ============================================================
+# PREP DATA PER OUTCOME
+# Filter, factorize, droplevels.
+# ============================================================
+prepped_data <- map(
+  OUTCOMES,
+  function(oc) {
+    df <- pedon_pack_150 %>%
+      select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))) %>%
+      prep_outcome(oc, min_n = MIN_N_MAP[[oc]])
+
+    list(
+      outcome = oc,
+      df      = df,
+      n       = nrow(df),
+      n_class = nlevels(df[[oc]])
+    )
+  }
+) %>% set_names(OUTCOMES)
+
+cat("\n--- Final modeling data per outcome ---\n")
+walk(prepped_data, ~ cat(.x$outcome, ": n =", .x$n,
+                          "| classes =", .x$n_class, "\n"))
+```
+
+```{r split}
+# ============================================================
+# 80/20 train/test split per outcome
+# Used for the FINAL production bundles. Nested CV uses its own
+# outer folds on the FULL prepped data.
+# ============================================================
+set.seed(2026)
+splits <- map(prepped_data, function(p) {
+  s <- initial_split(p$df, prop = 0.8, strata = !!sym(p$outcome))
+  list(train = training(s), test = testing(s))
+})
+
+cat("\n--- Split sizes ---\n")
+walk2(splits, names(splits), ~ cat(.y, ": train =", nrow(.x$train),
+                                     "| test =", nrow(.x$test), "\n"))
+```
+
+```{r nested-cv}
+# ============================================================
+# NESTED CV: outer 5 x inner 5 for each {outcome, engine, space}
+# This produces honest performance estimates with hyperparameter
+# tuning happening inside each outer fold.
+# ============================================================
+
+if (!FAST_MODE) {
+
+  cat("\n========================================\n")
+  cat("NESTED CV (5 outer x 5 inner)\n")
+  cat("This will take a while -- estimated hours.\n")
+  cat("========================================\n")
+
+  nested_cv_results <- list()
+
+  for (oc in OUTCOMES) {
+    p <- prepped_data[[oc]]
+    cat("\n>>> Outcome:", oc, "(", p$n, "pedons,", p$n_class, "classes)\n")
+
+    for (i in seq_len(nrow(MODEL_VARIANTS))) {
+      eng <- MODEL_VARIANTS$engine[i]
+      sp  <- MODEL_VARIANTS$space[i]
+      key <- paste(oc, eng, sp, sep = "_")
+
+      cat("  -- Variant:", eng, sp, "...\n")
+      t0 <- Sys.time()
+
+      fold_metrics <- tryCatch(
+        nested_cv_one_variant(
+          df = p$df %>% select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))),
+          outcome = oc, engine = eng, space = sp,
+          outer_v = OUTER_V, inner_v = INNER_V,
+          grid_size = GRID_SIZE, seed = 100 + i
+        ),
+        error = function(e) {
+          cat("     ERROR:", e$message, "\n")
+          tibble(fold = NA, accuracy = NA_real_, kap = NA_real_,
+                 bal_accuracy = NA_real_, f_meas_macro = NA_real_,
+                 n_test = NA_integer_, engine = eng, space = sp,
+                 outcome = oc)
+        }
+      )
+
+      dt <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1)
+      cat("     done in", dt, "min\n")
+
+      nested_cv_results[[key]] <- fold_metrics
+    }
+  }
+
+  nested_cv_long <- bind_rows(nested_cv_results)
+
+  # ---- Summary: mean +/- SD across outer folds ----
+  nested_cv_summary <- nested_cv_long %>%
+    filter(!is.na(fold)) %>%
+    group_by(outcome, engine, space) %>%
+    summarise(
+      n_folds          = n(),
+      accuracy_mean    = mean(accuracy,     na.rm = TRUE),
+      accuracy_sd      = sd(accuracy,       na.rm = TRUE),
+      kap_mean         = mean(kap,          na.rm = TRUE),
+      kap_sd           = sd(kap,            na.rm = TRUE),
+      bal_acc_mean     = mean(bal_accuracy, na.rm = TRUE),
+      bal_acc_sd       = sd(bal_accuracy,   na.rm = TRUE),
+      f_meas_mean      = mean(f_meas_macro, na.rm = TRUE),
+      f_meas_sd        = sd(f_meas_macro,   na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(outcome, desc(kap_mean))
+
+  cat("\n========================================\n")
+  cat("NESTED-CV SUMMARY\n")
+  cat("========================================\n")
+  print(nested_cv_summary, n = Inf)
+
+  write.csv(nested_cv_long,
+            "../outputs/reports_05_02/nested_cv_long_ncss.csv",
+            row.names = FALSE)
+  write.csv(nested_cv_summary,
+            "../outputs/reports_05_02/nested_cv_summary_ncss.csv",
+            row.names = FALSE)
+
+  saveRDS(nested_cv_results,
+          "../outputs/reports_05_02/nested_cv_results_ncss.rds")
+
+  beep("wilhelm")
+} else {
+  cat("FAST_MODE = TRUE: skipping nested CV.\n")
+  nested_cv_summary <- tibble()
+}
+```
+
+```{r final-bundles}
+# ============================================================
+# REPEATED 80/20 SPLITS (Option A): N replicates per bundle
+# Each replicate's bundle is saved to disk so Perry can deploy
+# all of them and compute deployment-side error bars too.
+# ============================================================
+
+N_REPLICATES <- 10  # number of repeated 80/20 splits
+
+cat("\n========================================\n")
+cat("REPEATED 80/20 SPLITS:", N_REPLICATES, "replicates\n")
+cat("Each (outcome × variant) gets fit", N_REPLICATES, "times.\n")
+cat("All replicate bundles saved to disk for Perry deployment.\n")
+cat("========================================\n")
+
+all_test_metrics_per_rep <- list()
+
+for (rep in seq_len(N_REPLICATES)) {
+
+  cat("\n>>> REPLICATE", rep, "of", N_REPLICATES, "\n")
+
+  # Fresh stratified split per replicate
+  set.seed(2026 + rep * 1000)
+  splits_rep <- map(prepped_data, function(p) {
+    s <- initial_split(p$df, prop = 0.8, strata = !!sym(p$outcome))
+    list(train = training(s), test = testing(s))
+  })
+
+  metrics_this_rep <- list()
+
+  for (oc in OUTCOMES) {
+    s <- splits_rep[[oc]]
+
+    for (i in seq_len(nrow(MODEL_VARIANTS))) {
+      eng <- MODEL_VARIANTS$engine[i]
+      sp  <- MODEL_VARIANTS$space[i]
+      bundle_name <- paste(oc, eng, sp, sep = "_")
+
+      # Naming convention: rep tagged in filename
+      rep_bundle_name <- paste0(bundle_name, "_rep", sprintf("%02d", rep))
+
+      cat("  -- rep", rep, "|", bundle_name, "...")
+      t0 <- Sys.time()
+
+      res <- tryCatch(
+        fit_one_model(
+          train_df = s$train %>% select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))),
+          test_df  = s$test  %>% select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))),
+          outcome = oc, engine = eng, space = sp,
+          inner_v = INNER_V, grid_size = GRID_SIZE,
+          seed = 200 + i + rep * 1000
+        ),
+        error = function(e) {
+          cat(" ERROR:", e$message, "\n")
+          NULL
+        }
+      )
+
+      if (is.null(res)) next
+
+      eval_metrics <- evaluate_predictions(
+        res$pred, truth_col = oc,
+        k_for_topk = if (oc == "taxonname_clean") 5 else 3
+      ) %>%
+        mutate(outcome = oc, engine = eng, space = sp,
+               bundle_name = bundle_name, replicate = rep)
+
+      metrics_this_rep[[bundle_name]] <- eval_metrics
+
+      # Build bundle (same name as before — replicate ID in $replicate field
+      # AND in the filename, but the bundle's $name is the canonical one
+      # so Perry's deployment logic doesn't have to change)
+      if (sp == "plain") {
+        bundle <- build_plain_bundle(
+          name = bundle_name, outcome = oc,
+          train_raw = res$train_raw,
+          prep_rec  = res$prep_rec,
+          final_fit = res$final_fit
+        )
+      } else {
+        # UMAP file goes alongside the bundle, also tagged with rep
+        umap_path <- paste0("../outputs/models_05_02/", rep_bundle_name, "_umap.uwot")
+        uwot::save_uwot(res$umap_fit, file = umap_path)
+
+        bundle <- build_umap_hdb_bundle(
+          name = bundle_name, outcome = oc,
+          train_raw = res$train_raw,
+          prep_rec  = res$prep_rec,
+          final_fit = res$final_fit,
+          umap_model_file = umap_path,
+          hdb_fit = res$hdb_fit, z_train = res$z_train,
+          umap_settings = list(n_components = 10, n_neighbors = 15,
+                               min_dist = 0.1, metric = "euclidean")
+        )
+      }
+
+      bundle$test_metrics <- eval_metrics
+      bundle$replicate <- rep
+      bundle$conf_mat <- conf_mat(
+        res$pred %>% rename(.truth = all_of(oc)),
+        truth = .truth, estimate = .pred_class
+      )
+
+      # Save with rep-tagged filename
+      saveRDS(bundle, paste0("../outputs/models_05_02/", rep_bundle_name, "_bundle.rds"))
+
+      dt <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1)
+      cat(" done in", dt, "min | kap =", round(eval_metrics$kap, 3), "\n")
+    }
+  }
+
+  all_test_metrics_per_rep[[rep]] <- bind_rows(metrics_this_rep)
+  beep("ping")
+}
+
+# Combine all metrics across replicates
+test_metrics_all_reps <- bind_rows(all_test_metrics_per_rep)
+
+write.csv(test_metrics_all_reps,
+          "../outputs/reports_05_02/test_metrics_all_reps_ncss.csv",
+          row.names = FALSE)
+
+cat("\nFinished all", N_REPLICATES, "replicates.\n")
+beep("wilhelm")
+```
+
+```{r aggregate-metrics}
+# ============================================================
+# AGGREGATE METRICS + PICK CANONICAL BUNDLE PER (outcome × variant)
+# Canonical = replicate whose kap is closest to the median.
+# That bundle gets saved without the _repNN suffix so Perry's
+# existing logic finds it by default.
+# ============================================================
+
+cat("\n========================================\n")
+cat("PICKING CANONICAL BUNDLES (median by kap)\n")
+cat("========================================\n")
+
+# Summary stats per (outcome × variant) across replicates
+test_metrics_summary <- test_metrics_all_reps %>%
+  group_by(outcome, engine, space, bundle_name) %>%
+  summarise(
+    n_replicates    = n(),
+    accuracy_mean   = mean(accuracy,     na.rm = TRUE),
+    accuracy_sd     = sd(accuracy,       na.rm = TRUE),
+    accuracy_median = median(accuracy,   na.rm = TRUE),
+    accuracy_lo_95  = quantile(accuracy, 0.025, na.rm = TRUE),
+    accuracy_hi_95  = quantile(accuracy, 0.975, na.rm = TRUE),
+    kap_mean        = mean(kap,          na.rm = TRUE),
+    kap_sd          = sd(kap,            na.rm = TRUE),
+    kap_median      = median(kap,        na.rm = TRUE),
+    kap_lo_95       = quantile(kap, 0.025, na.rm = TRUE),
+    kap_hi_95       = quantile(kap, 0.975, na.rm = TRUE),
+    bal_acc_mean    = mean(bal_accuracy, na.rm = TRUE),
+    bal_acc_sd      = sd(bal_accuracy,   na.rm = TRUE),
+    bal_acc_median  = median(bal_accuracy, na.rm = TRUE),
+    f_meas_mean     = mean(f_meas_macro, na.rm = TRUE),
+    f_meas_sd       = sd(f_meas_macro,   na.rm = TRUE),
+    top_k_mean      = mean(top_k,        na.rm = TRUE),
+    top_k_sd        = sd(top_k,          na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(test_metrics_summary, n = Inf)
+
+write.csv(test_metrics_summary,
+          "../outputs/reports_05_02/test_metrics_summary_repeated_ncss.csv",
+          row.names = FALSE)
+
+# For each (outcome × variant), find replicate closest to median kap
+canonical_picks <- test_metrics_all_reps %>%
+  left_join(
+    test_metrics_summary %>% select(outcome, engine, space, kap_median),
+    by = c("outcome", "engine", "space")
+  ) %>%
+  mutate(dist_to_median = abs(kap - kap_median)) %>%
+  group_by(outcome, engine, space, bundle_name) %>%
+  slice_min(dist_to_median, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(outcome, engine, space, bundle_name, replicate,
+         kap, kap_median, dist_to_median)
+
+cat("\n--- Canonical replicate per bundle (closest to median kap) ---\n")
+print(canonical_picks)
+
+write.csv(canonical_picks,
+          "../outputs/reports_05_02/canonical_replicate_picks.csv",
+          row.names = FALSE)
+
+# Copy the canonical replicate's bundle to its canonical filename
+cat("\nCopying canonical bundles...\n")
+for (i in seq_len(nrow(canonical_picks))) {
+  pick <- canonical_picks[i, ]
+  rep <- pick$replicate
+  bn  <- pick$bundle_name
+
+  src_bundle <- paste0("../outputs/models_05_02/", bn,
+                        "_rep", sprintf("%02d", rep), "_bundle.rds")
+  dst_bundle <- paste0("../outputs/models_05_02/", bn, "_bundle.rds")
+
+  if (!file.exists(src_bundle)) {
+    cat("  WARNING: missing", src_bundle, "\n")
+    next
+  }
+
+  # Load, attach summary stats, save with canonical name
+  b <- readRDS(src_bundle)
+  b$repeated_split_summary <- test_metrics_summary %>%
+    filter(bundle_name == bn) %>%
+    as.list()
+  saveRDS(b, dst_bundle)
+
+  # Copy associated UMAP file too
+  if ((b$model_type %||% "") == "umap_hdb") {
+    src_umap <- paste0("../outputs/models_05_02/", bn,
+                        "_rep", sprintf("%02d", rep), "_umap.uwot")
+    dst_umap <- paste0("../outputs/models_05_02/", bn, "_umap.uwot")
+    if (file.exists(src_umap)) {
+      file.copy(src_umap, dst_umap, overwrite = TRUE)
+    }
+  }
+
+  cat("  ", bn, "(rep", rep, ", kap =", round(pick$kap, 3), ")\n")
+}
+
+cat("\nCanonical bundles saved. Replicate bundles preserved with _repNN suffix.\n")
+beep("complete")
+```
+
+
+```{r series-final-bundle-low-threshold}
+# ============================================================
+# OPTIONAL: refit series with min_n=5 for higher coverage,
+# stored as a separate set of bundles.
+# Use these for actual deployment if you want broader series
+# coverage; nested-CV results above are at min_n=15.
+# ============================================================
+
+if ("taxonname_clean" %in% OUTCOMES) {
+
+  cat("\n>>> Refitting series at min_n=5 for deployment coverage\n")
+
+  df_series_lowthresh <- pedon_pack_150 %>%
+    select(-any_of(setdiff(TAXONOMY_DROP_COLS, "taxonname_clean"))) %>%
+    prep_outcome("taxonname_clean", min_n = 5) # nested CV used min_n=15, but we can fit more classes for deployment since we won't be doing nested CV there. This is a bit hacky but it lets us reuse the same code and compare results easily. (this is useful for the Greenville series n = 8, which is important to include in deployment but too small for nested CV).
+
+  cat("   n =", nrow(df_series_lowthresh),
+      "| classes =", nlevels(df_series_lowthresh$taxonname_clean), "\n")
+
+  set.seed(2027)
+  s5 <- initial_split(df_series_lowthresh, prop = 0.8, strata = taxonname_clean)
+  train_5 <- training(s5); test_5 <- testing(s5)
+
+  for (i in seq_len(nrow(MODEL_VARIANTS))) {
+    eng <- MODEL_VARIANTS$engine[i]
+    sp  <- MODEL_VARIANTS$space[i]
+    bn  <- paste("taxonname_clean_min5", eng, sp, sep = "_")
+
+    cat("  -- Fitting:", bn, "\n")
+    res <- tryCatch(
+      fit_one_model(
+        train_df = train_5, test_df = test_5,
+        outcome = "taxonname_clean", engine = eng, space = sp,
+        inner_v = 3,  # smaller because per-class N is small
+        grid_size = 10, seed = 300 + i
+      ),
+      error = function(e) { cat("     ERROR:", e$message, "\n"); NULL }
+    )
+    if (is.null(res)) next
+
+    eval_metrics <- evaluate_predictions(
+      res$pred, truth_col = "taxonname_clean", k_for_topk = 5
+    ) %>% mutate(bundle_name = bn)
+
+    if (sp == "plain") {
+      bundle <- build_plain_bundle(
+        name = bn, outcome = "taxonname_clean",
+        train_raw = res$train_raw,
+        prep_rec  = res$prep_rec,
+        final_fit = res$final_fit
+      )
+    } else {
+      umap_path <- paste0("../outputs/models_05_02/", bn, "_umap.uwot")
+      uwot::save_uwot(res$umap_fit, file = umap_path)
+      bundle <- build_umap_hdb_bundle(
+        name = bn, outcome = "taxonname_clean",
+        train_raw = res$train_raw, prep_rec = res$prep_rec,
+        final_fit = res$final_fit, umap_model_file = umap_path,
+        hdb_fit = res$hdb_fit, z_train = res$z_train,
+        umap_settings = list(n_components = 10, n_neighbors = 15,
+                             min_dist = 0.1, metric = "euclidean")
+      )
+    }
+    bundle$test_metrics <- eval_metrics
+    bundle$threshold_note <- "min_n=5 (deployment); nested CV used min_n=15"
+
+    saveRDS(bundle, paste0("../outputs/models_05_02/", bn, "_bundle.rds"))
+    cat("     kap =", round(eval_metrics$kap, 3),
+        "| top-5 =", round(eval_metrics$top_k, 3), "\n")
+  }
+}
+```
+
+```{r combined-summary}
+# ============================================================
+# COMBINED RESULTS TABLE: nested CV + test metrics + best per outcome
+# ============================================================
+
+if (!FAST_MODE && nrow(nested_cv_summary) > 0) {
+
+  combined <- nested_cv_summary %>%
+    left_join(
+      test_metrics_long %>%
+        select(outcome, engine, space,
+               test_accuracy = accuracy,
+               test_kap = kap,
+               test_bal_acc = bal_accuracy,
+               test_f1 = f_meas_macro,
+               test_topk = top_k),
+      by = c("outcome", "engine", "space")
+    )
+
+  cat("\n========================================\n")
+  cat("COMBINED RESULTS: NESTED CV + TEST SET\n")
+  cat("========================================\n")
+  print(combined, n = Inf)
+
+  write.csv(combined,
+            "../outputs/reports_05_02/combined_results_ncss.csv",
+            row.names = FALSE)
+
+  # ---- Best per outcome by each metric ----
+  cat("\n--- Best variant per outcome by KAP ---\n")
+  combined %>%
+    group_by(outcome) %>%
+    slice_max(kap_mean, n = 1, with_ties = FALSE) %>%
+    select(outcome, engine, space, kap_mean, kap_sd,
+           bal_acc_mean, f_meas_mean, test_kap) %>%
+    print()
+
+  cat("\n--- Best variant per outcome by BAL_ACCURACY ---\n")
+  combined %>%
+    group_by(outcome) %>%
+    slice_max(bal_acc_mean, n = 1, with_ties = FALSE) %>%
+    select(outcome, engine, space, bal_acc_mean, bal_acc_sd,
+           kap_mean, f_meas_mean, test_bal_acc) %>%
+    print()
+
+  cat("\n--- Best variant per outcome by MACRO F1 ---\n")
+  combined %>%
+    group_by(outcome) %>%
+    slice_max(f_meas_mean, n = 1, with_ties = FALSE) %>%
+    select(outcome, engine, space, f_meas_mean, f_meas_sd,
+           kap_mean, bal_acc_mean, test_f1) %>%
+    print()
+}
+
+cat("\n========================================\n")
+cat("DONE.\n")
+cat("- Class coverage: ../outputs/reports_05_02/class_coverage_summary_ncss.csv\n")
+cat("- Dropped classes: ../outputs/reports_05_02/dropped_classes_ncss.csv\n")
+cat("- Nested CV (long): ../outputs/reports_05_02/nested_cv_long_ncss.csv\n")
+cat("- Nested CV (summary): ../outputs/reports_05_02/nested_cv_summary_ncss.csv\n")
+cat("- Test metrics: ../outputs/reports_05_02/test_metrics_ncss.csv\n")
+cat("- Combined results: ../outputs/reports_05_02/combined_results_ncss.csv\n")
+cat("- Bundles: ../outputs/models_05_02/*_bundle.rds\n")
+cat("========================================\n")
+beep("complete")
+```
+
+```{r figures!}
+
+library(ggplot2)
+
+tax_order <- c("taxorder", "taxsuborder", "taxgrtgroup",
+               "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+ncss_model_compare <- nested_cv_summary %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    variant = paste(engine, space, sep = " / "),
+    variant = recode(variant,
+                     "rf / plain" = "RF (plain)",
+                     "xgb / plain" = "XGB (plain)",
+                     "rf / umap_hdb" = "RF (UMAP+HDB)",
+                     "xgb / umap_hdb" = "XGB (UMAP+HDB)")
+  )
+
+fig_ncss <- ggplot(ncss_model_compare,
+                   aes(x = outcome, y = kap_mean, color = engine, shape = space)) +
+  geom_errorbar(aes(ymin = kap_mean - kap_sd, ymax = kap_mean + kap_sd),
+                width = 0.25, position = position_dodge(width = 0.5)) +
+  geom_point(size = 3.5, position = position_dodge(width = 0.5)) +
+  scale_color_manual(values = c("rf" = "#2C7BB6", "xgb" = "#D7191C"),
+                     labels = c("Random Forest", "XGBoost"),
+                     name = "Engine") +
+  scale_shape_manual(values = c("plain" = 16, "umap_hdb" = 17),
+                     labels = c("Plain features", "UMAP + HDBSCAN"),
+                     name = "Feature space") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = NULL, y = "Cohen's Kappa (mean ± SD across outer folds)",
+       title = "NCSS nested cross-validation: model variant comparison",
+       subtitle = "Plain features outperform UMAP+HDBSCAN at every taxonomic level") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(fig_ncss)
+ggsave("../outputs/figures_05_02/fig_ncss_model_compare.png",
+       fig_ncss, width = 10, height = 6, dpi = 300)
+
+fig_ncss_heat <- ggplot(ncss_model_compare,
+                        aes(x = outcome, y = variant, fill = kap_mean)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", kap_mean)), size = 3.5) +
+  scale_fill_gradient(low = "#FDAE61", high = "#1A9641",
+                      limits = c(0.50, 0.90), name = "Kappa") +
+  labs(x = NULL, y = NULL,
+       title = "NCSS nested CV: model variants × taxonomic levels") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+print(fig_ncss_heat)
+ggsave("../outputs/figures_05_02/fig_ncss_heatmap.png",
+       fig_ncss_heat, width = 10, height = 6, dpi = 300)
+```
+
+```{r}
+library(tidyverse)
+library(here)
+
+# Load both files
+nested_cv <- read.csv(here("outputs", "reports_05_02", "nested_cv_summary_ncss.csv"))
+ncss_pack_path <- list.files(here("outputs"),
+                              pattern = "^pedon_pack_150_.*\\.csv$",
+                              full.names = TRUE)
+ncss_pack_path <- ncss_pack_path[which.max(file.mtime(ncss_pack_path))]
+ncss <- read.csv(ncss_pack_path)
+
+# Per-outcome thresholds (what you actually deployed)
+threshold_map <- tibble::tribble(
+  ~outcome,           ~min_n,
+  "taxorder",         15,
+  "taxsuborder",      15,
+  "taxgrtgroup",      15,
+  "taxsubgrp_mod1",   12,
+  "taxpartsize",      20,
+  "taxonname_clean",  5    # using min_n=5 as the primary series threshold
+)
+
+# Compute class and pedon retention for each outcome
+coverage <- ncss %>%
+  pivot_longer(c(taxorder, taxsuborder, taxgrtgroup, taxsubgrp_mod1,
+                 taxpartsize, taxonname_clean),
+               names_to = "outcome", values_to = "class") %>%
+  filter(!is.na(class), class != "") %>%
+  count(outcome, class) %>%
+  left_join(threshold_map, by = "outcome") %>%
+  mutate(retained = n >= min_n) %>%
+  group_by(outcome) %>%
+  summarise(
+    n_classes_total      = n(),
+    n_classes_retained   = sum(retained),
+    n_classes_dropped    = sum(!retained),
+    n_pedons_total       = sum(n),
+    n_pedons_retained    = sum(n[retained]),
+    n_pedons_dropped     = sum(n[!retained]),
+    pct_classes_retained = round(100 * n_classes_retained / n_classes_total, 1),
+    pct_pedons_retained  = round(100 * n_pedons_retained / n_pedons_total, 1),
+    .groups = "drop"
+  )
+
+print(coverage)
+
+# Pivot to long for plotting
+coverage_long <- coverage %>%
+  select(outcome,
+         `Classes` = pct_classes_retained,
+         `Pedons` = pct_pedons_retained,
+         n_classes_dropped, n_classes_retained,
+         n_pedons_dropped, n_pedons_retained) %>%
+  pivot_longer(cols = c(Classes, Pedons),
+               names_to = "level", values_to = "pct_retained") %>%
+  mutate(
+    pct_dropped = 100 - pct_retained,
+    n_dropped = if_else(level == "Classes", n_classes_dropped, n_pedons_dropped),
+    n_retained = if_else(level == "Classes", n_classes_retained, n_pedons_retained)
+  )
+
+# Order outcomes coarse to fine
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+coverage_long <- coverage_long %>%
+  mutate(outcome = factor(outcome,
+                          levels = tax_order,
+                          labels = tax_labels[tax_order]),
+         level = factor(level, levels = c("Pedons", "Classes")))  # Pedons on top reads better
+
+# Build the plot
+fig_coverage <- ggplot(coverage_long,
+                       aes(x = outcome, y = pct_retained, fill = level)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = paste0(pct_retained, "%")),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3.4, fontface = "bold") +
+  geom_text(aes(label = paste0("(", n_retained, "/", n_retained + n_dropped, ")")),
+            position = position_dodge(width = 0.8),
+            vjust = 1.5, size = 3, color = "white") +
+  scale_fill_manual(values = c("Pedons" = "#2C7BB6",
+                                "Classes" = "#D7191C"),
+                    name = NULL,
+                    labels = c("% pedons retained", "% classes retained")) +
+  scale_y_continuous(limits = c(0, 110),
+                     breaks = seq(0, 100, 25),
+                     expand = c(0, 0)) +
+  labs(x = NULL, y = "Retained (%)",
+       title = "Class and pedon retention after minimum-sample filtering",
+       subtitle = "Most pedons are retained even when most rare classes are dropped") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        axis.text.x = element_text(angle = 25, hjust = 1))
+
+print(fig_coverage)
+
+# Save
+ggsave(here("outputs", "figures_05_02", "ncss_class_coverage_pct.png"),
+       fig_coverage, width = 10, height = 6, dpi = 300)
+# Also save the underlying numbers as a CSV for the thesis
+write.csv(coverage,
+          here("outputs", "figures_05_02", "ncss_class_coverage_table.csv"),
+          row.names = FALSE)
+
+
+# Pedon-weighted retention
+dropped_summary <- dropped %>%
+  left_join(min_n_map, by = "outcome") %>%
+  filter(n_pedons < min_n) %>%
+  group_by(outcome) %>%
+  summarise(
+    n_classes_dropped = n(),
+    n_pedons_dropped = sum(n_pedons),
+    .groups = "drop"
+  )
+
+print(dropped_summary)
+
+# Apply min_n = 5 threshold for series only
+series_min5_summary <- ncss %>%
+  filter(!is.na(taxonname_clean)) %>%
+  count(taxonname_clean) %>%
+  mutate(retained = n >= 5) %>%
+  summarise(
+    n_classes_retained = sum(retained),
+    n_classes_dropped  = sum(!retained),
+    n_pedons_retained  = sum(n[retained]),
+    n_pedons_dropped   = sum(n[!retained]),
+    pct_pedons_retained = round(100 * n_pedons_retained /
+                                  (n_pedons_retained + n_pedons_dropped), 1)
+  )
+print(series_min5_summary)
+library(tidyverse)
+library(here)
+
+reps <- read.csv(here("outputs", "reports_05_02",
+                      "test_metrics_all_reps_ncss.csv"))
+
+summary_table <- reps %>%
+  group_by(outcome, engine, space) %>%
+  summarise(
+    n_reps          = n(),
+    kap_median      = median(kap),
+    kap_lo_95       = quantile(kap, 0.025),
+    kap_hi_95       = quantile(kap, 0.975),
+    kap_mean        = mean(kap),
+    kap_sd          = sd(kap),
+    accuracy_median = median(accuracy),
+    accuracy_lo_95  = quantile(accuracy, 0.025),
+    accuracy_hi_95  = quantile(accuracy, 0.975),
+    bal_acc_median  = median(bal_accuracy, na.rm = TRUE),
+    bal_acc_lo_95   = quantile(bal_accuracy, 0.025, na.rm = TRUE),
+    bal_acc_hi_95   = quantile(bal_accuracy, 0.975, na.rm = TRUE),
+    f_meas_median   = median(f_meas_macro, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(outcome, desc(kap_median))
+
+print(summary_table, n = Inf)
+
+write.csv(summary_table,
+          here("outputs", "reports_05_02", "test_metrics_summary_clean.csv"),
+          row.names = FALSE)
+# Pull NCSS summary from the repeated splits
+  ncss_for_plot <- read.csv("../outputs/reports_05_02/test_metrics_summary_clean.csv") %>%
+  group_by(outcome) %>%
+  slice_max(kap_median, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    dataset = "NCSS (internal test)",
+    kap_value = kap_median,
+    kap_lo = kap_lo_95,
+    kap_hi = kap_hi_95
+  )
+
+# Perry: point estimate, no CI
+perry_for_plot <- perry_metric_summary %>%
+  filter(!is_min5 | outcome != "taxonname_clean") %>%
+  group_by(outcome) %>%
+  slice_max(kap, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    dataset = "Perry (external)",
+    kap_value = kap,
+    kap_lo = NA_real_,    # no error bars on Perry
+    kap_hi = NA_real_
+  )
+
+fig1_data <- bind_rows(
+  ncss_for_plot %>% select(outcome, engine, space, dataset,
+                            kap_value, kap_lo, kap_hi),
+  perry_for_plot %>% select(outcome, engine, space, dataset,
+                             kap_value, kap_lo, kap_hi)
+) %>%
+  left_join(n_classes_lookup, by = "outcome") %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    dataset = factor(dataset, levels = c("NCSS (internal test)", "Perry (external)"))
+  )
+
+fig1 <- ggplot(fig1_data, aes(x = outcome, y = kap_value, fill = dataset)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = kap_lo, ymax = kap_hi),
+                position = position_dodge(width = 0.8),
+                width = 0.25, na.rm = TRUE, linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", kap_value)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3.2) +
+  geom_text(data = fig1_data %>% distinct(outcome, n_classes_max),
+            aes(x = outcome, y = 1.06, label = paste0("k=", n_classes_max)),
+            inherit.aes = FALSE, size = 3.2, fontface = "italic", color = "grey30") +
+  scale_fill_manual(values = c("NCSS (internal test)" = "#2C7BB6",
+                                "Perry (external)" = "#D7191C"),
+                    name = NULL) +
+  scale_y_continuous(limits = c(0, 1.10), expand = c(0, 0)) +
+  labs(x = NULL, y = "Cohen's Kappa",
+       title = "Model performance degrades from coarse to fine taxonomic levels\n",
+       subtitle = "NCSS error bars: 95% range across 10 train/test replicates;\n Perry: point estimate from canonical bundle") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+print(fig1)
+reps <- read.csv(here("outputs", "reports_05_02", "test_metrics_all_reps_ncss.csv"))
+
+reps_for_plot <- reps %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    variant = paste(engine, space, sep = " / "),
+    variant = recode(variant,
+                     "rf / plain"     = "RF (plain)",
+                     "xgb / plain"    = "XGB (plain)",
+                     "rf / umap_hdb"  = "RF (UMAP+HDB)",
+                     "xgb / umap_hdb" = "XGB (UMAP+HDB)")
+  )
+
+fig_variability <- ggplot(reps_for_plot,
+                          aes(x = outcome, y = kap, fill = variant)) +
+  geom_boxplot(position = position_dodge(width = 0.85),
+               width = 0.7, outlier.size = 1) +
+  scale_fill_manual(values = c("RF (plain)" = "#2C7BB6",
+                                "XGB (plain)" = "#1A9641",
+                                "RF (UMAP+HDB)" = "#FDAE61",
+                                "XGB (UMAP+HDB)" = "#D7191C"),
+                    name = NULL) +
+  scale_y_continuous(limits = c(0.2, 1.05), expand = c(0, 0)) +
+  labs(x = NULL, y = "Cohen's Kappa",
+       title = "NCSS internal performance variability across 10 train/test splits\n",
+       subtitle = "Plain features outperform UMAP+HDB at every taxonomic level,\n with tighter distributions") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "top")
+
+print(fig_variability)
+ggsave(here("outputs", "figures_05_02", "fig_variability_boxplots.png"),
+       fig_variability, width = 12, height = 6, dpi = 300)
+```
+
+```{r}
+library(tidyverse)
+library(here)
+library(yardstick)
+library(patchwork)
+
+fig_dir <- here("outputs", "figures_05_02")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+thesis_theme <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# Load all canonical bundles (skip _repNN_)
+bundle_files <- list.files(here("outputs", "models_05_02"),
+                           pattern = "_bundle\\.rds$",
+                           full.names = TRUE)
+bundle_files <- bundle_files[
+  !str_detect(basename(bundle_files), "_rep[0-9]+_bundle\\.rds$") &
+    basename(bundle_files) != "taxsubgrp_xgb_plain_bundle.rds"
+]
+bundles <- map(bundle_files, readRDS) %>%
+  set_names(map_chr(., "name"))
+
+# Pick the best variant per outcome (by kap_median from repeated splits)
+summary_clean <- read.csv(here("outputs", "reports_05_02",
+                                "test_metrics_summary_clean.csv"))
+best_per_outcome <- summary_clean %>%
+  group_by(outcome) %>%
+  slice_max(kap_median, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(bundle_name = paste(outcome, engine, space, sep = "_"))
+
+cat("Best variant per outcome:\n")
+print(best_per_outcome %>% select(outcome, engine, space, kap_median))
+
+
+plot_ncss_confusion <- function(bundle, max_classes = 12) {
+  cm_df <- bundle$conf_mat$table %>%
+    as.data.frame() %>%
+    rename(truth = Truth, pred = Prediction, n = Freq)
+
+  # Compute row-proportions (what fraction of each true class went where)
+  cm_df <- cm_df %>%
+    group_by(truth) %>%
+    mutate(
+      row_total = sum(n),
+      prop = ifelse(row_total == 0, 0, n / row_total)
+    ) %>%
+    ungroup() %>%
+    select(-row_total)
+
+  # If too many classes, keep top N by truth frequency
+  if (length(unique(cm_df$truth)) > max_classes) {
+    keep <- cm_df %>%
+      group_by(truth) %>% summarise(total = sum(n), .groups = "drop") %>%
+      slice_max(total, n = max_classes) %>% pull(truth) %>% as.character()
+    cm_df <- cm_df %>%
+      filter(as.character(truth) %in% keep,
+             as.character(pred) %in% keep)
+  }
+
+  ggplot(cm_df, aes(x = pred, y = truth, fill = prop)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = ifelse(n == 0, "", n)), size = 3) +
+    scale_fill_gradient(low = "white", high = "#2C7BB6",
+                        limits = c(0, 1), name = "Row prop") +
+    labs(x = "Predicted", y = "Observed",
+         title = tax_labels[bundle$outcome]) +
+    thesis_theme +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          panel.grid = element_blank(),
+          legend.position = "right")
+}
+
+# Build one CM per outcome using the best variant
+ncss_cm_plots <- list()
+for (i in seq_len(nrow(best_per_outcome))) {
+  oc <- best_per_outcome$outcome[i]
+  bn <- best_per_outcome$bundle_name[i]
+  b  <- bundles[[bn]]
+  if (is.null(b) || is.null(b$conf_mat)) {
+    cat("WARNING: missing bundle or conf_mat for", bn, "\n")
+    next
+  }
+  ncss_cm_plots[[oc]] <- plot_ncss_confusion(b, max_classes = 12)
+}
+
+# Stack into 3x2 grid
+fig_ncss_cm <- (ncss_cm_plots$taxorder      + ncss_cm_plots$taxsuborder) /
+               (ncss_cm_plots$taxgrtgroup   + ncss_cm_plots$taxsubgrp_mod1) /
+               (ncss_cm_plots$taxpartsize   + ncss_cm_plots$taxonname_clean) +
+  plot_annotation(
+    title = "NCSS internal-test confusion matrices (canonical replicate)",
+    subtitle = "Cell color = row-proportion; cell number = pedon count",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(fig_ncss_cm)
+ggsave(file.path(fig_dir, "fig_ncss_confusion_matrices.png"),
+       fig_ncss_cm, width = 14, height = 15, dpi = 300)
+
+library(vip)
+
+extract_vip <- function(bundle, top_n = 20) {
+  # Pull the underlying model object from the workflow
+  fit_obj <- extract_fit_engine(bundle$final_fit)
+  
+  # Get feature names from the recipe
+  rec <- bundle$prep_rec
+  feature_names <- names(bake(rec, new_data = NULL))
+  feature_names <- setdiff(feature_names, c(bundle$outcome, "peiid"))
+  
+  # Engine-specific importance
+  imp <- tryCatch({
+    if (inherits(fit_obj, "ranger")) {
+      # Random Forest
+      tibble(
+        feature = names(fit_obj$variable.importance),
+        importance = fit_obj$variable.importance
+      )
+    } else if (inherits(fit_obj, "xgb.Booster")) {
+      # XGBoost
+      xgb_imp <- xgboost::xgb.importance(model = fit_obj)
+      tibble(
+        feature = xgb_imp$Feature,
+        importance = xgb_imp$Gain
+      )
+    } else {
+      cat("Unknown model class for", bundle$name, "\n")
+      return(NULL)
+    }
+  }, error = function(e) {
+    cat("VIP error for", bundle$name, ":", e$message, "\n")
+    NULL
+  })
+  
+  if (is.null(imp)) return(NULL)
+  
+  imp %>%
+    arrange(desc(importance)) %>%
+    slice_head(n = top_n) %>%
+    mutate(outcome = bundle$outcome,
+           bundle_name = bundle$name)
+}
+
+# Extract VIP for each outcome's best variant
+vip_data <- map_dfr(seq_len(nrow(best_per_outcome)), function(i) {
+  bn <- best_per_outcome$bundle_name[i]
+  if (is.null(bundles[[bn]])) return(NULL)
+  extract_vip(bundles[[bn]], top_n = 15)
+})
+
+# Plot one VIP per outcome (small multiples)
+plot_vip <- function(d, title) {
+  d %>%
+    mutate(feature = fct_reorder(feature, importance)) %>%
+    ggplot(aes(x = importance, y = feature)) +
+    geom_col(fill = "#2C7BB6") +
+    labs(x = "Importance", y = NULL, title = title) +
+    thesis_theme +
+    theme(axis.text.y = element_text(size = 9))
+}
+
+vip_plots <- vip_data %>%
+  group_split(outcome) %>%
+  map(~ plot_vip(.x, tax_labels[unique(.x$outcome)]))
+
+names(vip_plots) <- vip_data %>% distinct(outcome) %>% pull(outcome)
+
+# Stack into 3x2 grid
+fig_vip <- (vip_plots$taxorder      + vip_plots$taxsuborder) /
+           (vip_plots$taxgrtgroup   + vip_plots$taxsubgrp_mod1) /
+           (vip_plots$taxpartsize   + vip_plots$taxonname_clean) +
+  plot_annotation(
+    title = "Top 15 predictors per taxonomic level (NCSS-trained, best variant)",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+print(fig_vip)
+ggsave(file.path(fig_dir, "fig_ncss_vip.png"),
+       fig_vip, width = 14, height = 15, dpi = 300)
+
+# Also save the underlying VIP table for thesis appendix
+write.csv(vip_data,
+          here("outputs", "reports_05_02", "ncss_vip_top15.csv"),
+          row.names = FALSE)
+
+
+# this is only for training data, so it's not a true "top-k accuracy" that you'd get on unseen data, but it gives a sense of how well the model ranks the true class among its predictions. It's also useful for understanding how many classes the model is effectively distinguishing between, especially at finer taxonomic levels where there are many classes.
+top_k_from_bundle <- function(bundle, k_max = 10) {
+  oc <- bundle$outcome
+  train <- bundle$train_raw
+  
+  # Predict probabilities on training data
+  preds <- predict(bundle$final_fit, new_data = train, type = "prob")
+  
+  # Get class names
+  prob_cols <- grep("^\\.pred_", names(preds), value = TRUE)
+  class_names <- str_remove(prob_cols, "^\\.pred_")
+  truth <- as.character(train[[oc]])
+  
+  # For each row, get the rank of the truth class
+  rank_of_truth <- map_int(seq_len(nrow(preds)), function(i) {
+    p <- as.numeric(preds[i, prob_cols])
+    names(p) <- class_names
+    sorted <- sort(p, decreasing = TRUE)
+    rank <- which(names(sorted) == truth[i])
+    if (length(rank) == 0) NA_integer_ else rank
+  })
+  
+  # Top-k accuracy = proportion of pedons where truth is rank <= k
+  k_max_actual <- min(k_max, length(class_names))
+  tibble(
+    outcome = oc,
+    k = 1:k_max_actual,
+    top_k_accuracy = map_dbl(1:k_max_actual, ~ mean(rank_of_truth <= .x, na.rm = TRUE))
+  )
+}
+
+# Compute for canonical bundles only (best variant per outcome)
+top_k_curves <- map_dfr(seq_len(nrow(best_per_outcome)), function(i) {
+  bn <- best_per_outcome$bundle_name[i]
+  if (is.null(bundles[[bn]])) return(NULL)
+  top_k_from_bundle(bundles[[bn]], k_max = 10)
+})
+
+top_k_curves <- top_k_curves %>%
+  mutate(outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]))
+
+fig_top_k <- ggplot(top_k_curves,
+                    aes(x = k, y = top_k_accuracy, color = outcome)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  scale_color_brewer(palette = "Dark2", name = NULL) +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent_format(),
+                     expand = c(0, 0.01)) +
+  labs(x = "k (top-k predictions considered)",
+       y = "Top-k accuracy",
+       title = "Top-k accuracy curves on NCSS training data",
+       subtitle = "Best variant per outcome; truth is recovered within top-k for high k") +
+  thesis_theme
+
+print(fig_top_k)
+ggsave(file.path(fig_dir, "fig_ncss_top_k.png"),
+       fig_top_k, width = 9, height = 6, dpi = 300)
+
+#heatmap of top-k accuracy at k=5 for best variant per outcome (TRAINING DATA!!!!)
+library(tidyverse)
+library(here)
+library(patchwork)
+
+# We need test-set predictions per replicate. Each rep bundle contains
+# train_raw but NOT a held-out test set with predictions. We need to
+# reconstruct: for each rep, recreate the 80/20 split and predict on test.
+
+# Load all rep-tagged bundles
+rep_bundle_files <- list.files(here("outputs", "models_05_02"),
+                                pattern = "_rep[0-9]+_bundle\\.rds$",
+                                full.names = TRUE)
+
+cat("Found", length(rep_bundle_files), "replicate bundles\n")
+
+# Load the original full NCSS pack to recreate splits
+ncss_pack_files <- list.files(here("outputs"),
+                              pattern = "^pedon_pack_150_.*\\.csv$",
+                              full.names = TRUE)
+ncss_pack_path <- ncss_pack_files[which.max(file.mtime(ncss_pack_files))]
+ncss_full <- read.csv(ncss_pack_path) %>%
+  mutate(peiid = as.character(peiid))
+
+# Helper: get test set for a given replicate using the same seed logic
+# as in your NCSS_models.qmd (set.seed(2026 + rep * 1000))
+get_test_predictions <- function(bundle, full_data, rep_num) {
+  oc <- bundle$outcome
+  
+  # Recreate the prep_outcome filter (drop classes below min_n)
+  source(here("code", "modeling_functions_05_02_2026.R"))
+  
+  min_n_lookup <- c(taxorder = 15, taxsuborder = 15, taxgrtgroup = 15,
+                    taxsubgrp_mod1 = 12, taxpartsize = 20,
+                    taxonname_clean = 5)  # using min_n=15 for series to match the main NCSS run
+  
+  df_prepped <- full_data %>%
+    select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))) %>%
+    prep_outcome(oc, min_n = min_n_lookup[[oc]])
+  
+  # Recreate the split with the same seed
+  set.seed(2026 + rep_num * 1000)
+  s <- initial_split(df_prepped, prop = 0.8, strata = !!sym(oc))
+  test_df <- testing(s)
+  
+  # Predict probabilities on test set
+  preds <- predict(bundle$final_fit, new_data = test_df, type = "prob")
+  preds$truth <- as.character(test_df[[oc]])
+  preds$peiid <- as.character(test_df$peiid)
+  preds$replicate <- rep_num
+  preds$outcome <- oc
+  preds$bundle_name <- bundle$name
+  
+  preds
+}
+
+# Pick the best variant per outcome (any engine, any space) by median kappa
+best_per_outcome <- summary_clean %>%
+  group_by(outcome) %>%
+  slice_max(kap_median, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(bundle_root = paste(outcome, engine, space, sep = "_"))
+
+cat("Best variant per outcome:\n")
+print(best_per_outcome %>% select(outcome, engine, space, kap_median, bundle_root))
+
+# Build rep_meta from all replicate bundles, then filter to the best per outcome
+rep_meta <- tibble(
+  filepath = rep_bundle_files,
+  basename = basename(rep_bundle_files),
+  bundle_root = str_remove(basename(rep_bundle_files),
+                            "_rep[0-9]+_bundle\\.rds$"),
+  rep_num = as.integer(str_extract(basename(rep_bundle_files), "(?<=_rep)[0-9]+"))
+) %>%
+  filter(bundle_root %in% best_per_outcome$bundle_root)
+
+cat("Processing", nrow(rep_meta), "replicate bundles for rank-of-truth\n")
+
+all_test_preds <- map_dfr(seq_len(nrow(rep_meta)), function(i) {
+  rm <- rep_meta[i, ]
+  cat("  rep", rm$rep_num, "|", rm$bundle_root, "\n")
+  
+  b <- readRDS(rm$filepath)
+  tryCatch(
+    get_test_predictions(b, ncss_full, rm$rep_num),
+    error = function(e) {
+      cat("    ERROR:", e$message, "\n")
+      NULL
+    }
+  )
+})
+
+cat("\nTotal test predictions across all reps:", nrow(all_test_preds), "\n")
+
+compute_rank_and_pred_what <- function(preds_df) {
+  prob_cols <- grep("^\\.pred_", names(preds_df), value = TRUE)
+  class_names <- str_remove(prob_cols, "^\\.pred_")
+  
+  # For each pedon, compute ranks for ALL classes
+  result <- map_dfr(seq_len(nrow(preds_df)), function(i) {
+    p <- as.numeric(preds_df[i, prob_cols])
+    names(p) <- class_names
+    sorted <- sort(p, decreasing = TRUE)
+    
+    truth <- preds_df$truth[i]
+    if (is.na(truth)) return(NULL)
+    
+    rank_truth <- which(names(sorted) == truth)
+    if (length(rank_truth) == 0) rank_truth <- NA_integer_
+    
+    tibble(
+      peiid = preds_df$peiid[i],
+      replicate = preds_df$replicate[i],
+      outcome = preds_df$outcome[i],
+      truth = truth,
+      rank1_class = names(sorted)[1],
+      rank2_class = if (length(sorted) >= 2) names(sorted)[2] else NA_character_,
+      rank3_class = if (length(sorted) >= 3) names(sorted)[3] else NA_character_,
+      rank_of_truth = rank_truth,
+      pred_top1 = names(sorted)[1]
+    )
+  })
+  
+  result
+}
+
+# Apply per outcome (this can take a few minutes)
+ranks_full <- compute_rank_and_pred_what(all_test_preds)
+
+cat("Total ranked predictions:", nrow(ranks_full), "\n")
+write.csv(ranks_full,
+          here("outputs", "reports_05_02", "ncss_test_ranks.csv"),
+          row.names = FALSE)
+
+plot_rank_with_pred <- function(rank_df, outcome_label) {
+  rank_df <- rank_df %>%
+    filter(!is.na(rank_of_truth)) %>%
+    mutate(
+      rank_category = case_when(
+        rank_of_truth == 1 ~ "Rank 1\n(correct)",
+        rank_of_truth == 2 ~ "Rank 2\n(close miss)",
+        rank_of_truth == 3 ~ "Rank 3",
+        rank_of_truth >= 4 & rank_of_truth <= 5 ~ "Rank 4-5",
+        rank_of_truth >= 6 ~ "Rank 6+\n(off)"
+      ),
+      rank_category = factor(rank_category,
+                             levels = c("Rank 1\n(correct)",
+                                        "Rank 2\n(close miss)",
+                                        "Rank 3",
+                                        "Rank 4-5",
+                                        "Rank 6+\n(off)"))
+    )
+  
+  # Order classes by total count (most common at top)
+  truth_order <- rank_df %>% count(truth) %>% arrange(n) %>% pull(truth)
+  
+  # For each true class, summarize what was predicted in misses
+  rank_summary <- rank_df %>%
+    count(truth, rank_category) %>%
+    group_by(truth) %>%
+    mutate(prop = n / sum(n)) %>%
+    ungroup() %>%
+    mutate(truth = factor(truth, levels = truth_order))
+  
+  # Get top "predicted instead" per (truth × rank category) for misses
+  predicted_instead <- rank_df %>%
+    filter(rank_of_truth >= 2) %>%
+    mutate(
+      rank_category = case_when(
+        rank_of_truth == 2 ~ "Rank 2\n(close miss)",
+        rank_of_truth == 3 ~ "Rank 3",
+        rank_of_truth >= 4 & rank_of_truth <= 5 ~ "Rank 4-5",
+        rank_of_truth >= 6 ~ "Rank 6+\n(off)"
+      ),
+      rank_category = factor(rank_category,
+                             levels = c("Rank 1\n(correct)",
+                                        "Rank 2\n(close miss)",
+                                        "Rank 3",
+                                        "Rank 4-5",
+                                        "Rank 6+\n(off)"))
+    ) %>%
+    count(truth, rank_category, pred_top1, sort = TRUE) %>%
+    group_by(truth, rank_category) %>%
+    slice_max(n, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    rename(top_pred_label = pred_top1)
+  
+  # Join the predicted-instead labels to the heatmap data
+  rank_summary <- rank_summary %>%
+    left_join(predicted_instead %>% select(truth, rank_category, top_pred_label),
+              by = c("truth", "rank_category"))
+  
+  # Build cell labels: count + (predicted-instead) for misses
+  rank_summary <- rank_summary %>%
+    mutate(
+      cell_label = case_when(
+        n == 0 ~ "",
+        rank_category == "Rank 1\n(correct)" ~ as.character(n),
+        !is.na(top_pred_label) ~ paste0(n, "\n→ ", top_pred_label),
+        TRUE ~ as.character(n)
+      )
+    )
+  
+  ggplot(rank_summary, aes(x = rank_category, y = truth, fill = prop)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = cell_label), size = 4, lineheight = 0.85) +
+    scale_fill_gradient2(low = "#D55E00", mid = "#E69F00", high = "#009E73",
+                         midpoint = 0.3,
+                         limits = c(0, 1),
+                         name = "Row prop") +
+    labs(x = "Rank of truth in model's predictions",
+         y = "True class",
+         title = outcome_label) +
+    thesis_theme +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5, size = 8),
+          axis.text.y = element_text(size = 8),
+          panel.grid = element_blank(),
+          legend.position = "right")
+}
+
+# One plot per outcome (no max_classes — show all)
+rank_plots <- list()
+outcomes_with_data <- ranks_full %>% distinct(outcome) %>% pull(outcome)
+
+for (oc in outcomes_with_data) {
+  rd <- ranks_full %>% filter(outcome == oc)
+  if (nrow(rd) == 0) next
+  rank_plots[[oc]] <- plot_rank_with_pred(rd, tax_labels[oc])
+}
+
+# Print one at a time first, then combine
+for (oc in names(rank_plots)) {
+  print(rank_plots[[oc]])
+  ggsave(file.path(fig_dir, paste0("fig_ncss_rank_", oc, ".png")),
+         rank_plots[[oc]],
+         width = 11, height = 8, dpi = 300)
+}
+library(cowplot)
+
+# Reorder by tax_order
+ordered_plots_NCSS <- rank_plots[tax_order]
+ordered_plots_NCSS <- ordered_plots_NCSS[!sapply(ordered_plots_NCSS, is.null)]
+
+# Build a "with legend" version of the first plot just to extract the legend
+first_outcome <- names(ordered_plots_NCSS)[1]
+plot_with_legend <- plot_rank_with_pred(
+  ranks_full %>% filter(outcome == first_outcome),
+  tax_labels[first_outcome]
+)
+
+# Extract the legend grob
+shared_legend <- get_legend(plot_with_legend)
+
+# Remove legends from all panels
+ordered_plots_NCSS_no_legend <- map(ordered_plots_NCSS, function(p) {
+  p + scale_fill_gradient2(
+    low = "#D55E00", mid = "#E69F00", high = "#009E73",
+    midpoint = 0.3, limits = c(0, 1),
+    guide = "none"
+  )
+})
+
+# Build patchwork of panels (no legend on any)
+panels <- wrap_plots(ordered_plots_NCSS_no_legend, ncol = 2) +
+  plot_annotation(
+    title = "Rank of true class in NCSS test predictions (best variant, all reps)",
+    subtitle = "Cell color = row-proportion; cell text = count + (most common predicted instead for misses)",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+# Combine panels + legend in a horizontal layout
+fig_ranks <- plot_grid(panels, shared_legend,
+                       ncol = 2,
+                       rel_widths = c(1, 0.08))
+
+print(fig_ranks)
+ggsave(file.path(fig_dir, "fig_ncss_rank_all.png"),
+       fig_ranks, width = 16, height = 18, dpi = 300)
+```
+
+
+```{r}
+#vip plot
+library(tidyverse)
+library(here)
+library(patchwork)
+
+fig_dir <- here("outputs", "figures_05_02")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+thesis_theme <- theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# ============================================================
+# IDENTIFY BEST PLAIN VARIANT PER OUTCOME
+# (no min5 override — uses whatever the bootstrap data shows is best)
+# ============================================================
+summary_clean <- read.csv(here("outputs", "reports_05_02",
+                                "test_metrics_summary_clean.csv"))
+
+best_plain_per_outcome <- summary_clean %>%
+  filter(space == "plain") %>%
+  group_by(outcome) %>%
+  slice_max(kap_median, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(bundle_root = paste(outcome, engine, space, sep = "_"))
+
+cat("Using bundles:\n")
+print(best_plain_per_outcome %>% select(outcome, engine, space, bundle_root))
+
+# ============================================================
+# EXTRACT VIP FROM ALL 10 REPLICATE BUNDLES, AVERAGE
+# ============================================================
+extract_vip_from_bundle <- function(bundle_path) {
+  b <- tryCatch(readRDS(bundle_path), error = function(e) NULL)
+  if (is.null(b)) return(NULL)
+
+  fit_obj <- workflows::extract_fit_engine(b$final_fit)
+
+  imp <- tryCatch({
+    if (inherits(fit_obj, "ranger")) {
+      tibble(
+        feature = names(fit_obj$variable.importance),
+        importance = as.numeric(fit_obj$variable.importance)
+      )
+    } else if (inherits(fit_obj, "xgb.Booster")) {
+      xgb_imp <- xgboost::xgb.importance(model = fit_obj)
+      tibble(feature = xgb_imp$Feature, importance = xgb_imp$Gain)
+    } else {
+      return(NULL)
+    }
+  }, error = function(e) return(NULL))
+
+  if (is.null(imp)) return(NULL)
+  imp %>% mutate(importance = importance / sum(importance, na.rm = TRUE))
+}
+
+all_vip <- map_dfr(seq_len(nrow(best_plain_per_outcome)), function(i) {
+  bundle_root <- best_plain_per_outcome$bundle_root[i]
+  oc <- best_plain_per_outcome$outcome[i]
+
+  cat("Processing", bundle_root, "...\n")
+
+  rep_files <- list.files(here("outputs", "models_05_02"),
+                          pattern = paste0("^", bundle_root,
+                                            "_rep[0-9]+_bundle\\.rds$"),
+                          full.names = TRUE)
+
+  if (length(rep_files) == 0) {
+    cat("  WARNING: no replicate bundles for", bundle_root, "\n")
+    return(NULL)
+  }
+
+  cat("  Found", length(rep_files), "replicate bundles\n")
+
+  rep_vips <- map_dfr(rep_files, function(fp) {
+    rep_num <- as.integer(str_extract(basename(fp), "(?<=_rep)[0-9]+"))
+    v <- extract_vip_from_bundle(fp)
+    if (is.null(v)) return(NULL)
+    v %>% mutate(replicate = rep_num)
+  })
+
+  if (nrow(rep_vips) == 0) return(NULL)
+
+  rep_vips %>%
+    group_by(feature) %>%
+    summarise(
+      importance_median = median(importance, na.rm = TRUE),
+      importance_lo     = quantile(importance, 0.25, na.rm = TRUE),
+      importance_hi     = quantile(importance, 0.75, na.rm = TRUE),
+      n_reps_present    = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(outcome = oc, bundle_root = bundle_root)
+})
+
+write.csv(all_vip,
+          here("outputs", "reports_05_02", "ncss_vip_median_across_reps.csv"),
+          row.names = FALSE)
+
+cat("\nAll outcomes processed. Found data for:\n")
+print(unique(all_vip$outcome))
+
+# ============================================================
+# PLOT WITH GRADIENT COLORS + SHARED X-AXIS LABEL PER COLUMN
+# ============================================================
+plot_vip <- function(vip_df, outcome_label, top_n = 15,
+                     show_x_axis = TRUE) {
+  d <- vip_df %>%
+    arrange(desc(importance_median)) %>%
+    slice_head(n = top_n) %>%
+    mutate(feature = fct_reorder(feature, importance_median))
+
+  p <- ggplot(d, aes(x = importance_median, y = feature,
+                     fill = importance_median)) +
+    geom_col() +
+    geom_errorbar(aes(xmin = importance_lo, xmax = importance_hi),
+                  width = 0.3, color = "grey30", linewidth = 0.4) +
+    scale_fill_gradient(low = "#FDAE61", high = "#08519C",
+                        name = NULL, guide = "none") +
+    labs(y = NULL, title = outcome_label) +
+    thesis_theme +
+    theme(axis.text.y = element_text(size = 8))
+
+  if (show_x_axis) {
+    p <- p + labs(x = "Median normalized importance (IQR across 10 reps)")
+  } else {
+    p <- p + labs(x = NULL) +
+      theme(axis.title.x = element_blank())
+  }
+
+  p
+}
+
+# Layout plan (2 columns):
+# Row 1: Order      | Suborder
+# Row 2: Great Grp  | Subgroup
+# Row 3: Part Size  | Series   <-- bottom row gets x-axis label
+vip_plots <- list()
+for (i in seq_along(tax_order)) {
+  oc <- tax_order[i]
+  d <- all_vip %>% filter(outcome == oc)
+  if (nrow(d) == 0) next
+
+  # Only the last two plots (bottom row) show x-axis label
+  is_bottom_row <- i %in% c(5, 6)
+  vip_plots[[oc]] <- plot_vip(d, tax_labels[oc], top_n = 15,
+                              show_x_axis = is_bottom_row)
+}
+
+# Combine — order matters for the row assignment
+ordered_plots <- vip_plots[tax_order]
+ordered_plots <- ordered_plots[!sapply(ordered_plots, is.null)]
+
+fig_vip <- wrap_plots(ordered_plots, ncol = 2) +
+  plot_annotation(
+    title = "Top 15 predictors per taxonomic level (median across 10 NCSS train/test replicates)",
+    subtitle = "Color gradient = median normalized importance; error bars = IQR across replicates",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"),
+                  plot.subtitle = element_text(size = 11, color = "grey30"))
+  )
+
+print(fig_vip)
+ggsave(file.path(fig_dir, "fig_ncss_vip_median.png"),
+       fig_vip, width = 14, height = 16, dpi = 300)
+```
+
+```{r}
+# ============================================================
+# NCSS CONFUSION MATRICES — one panel per outcome
+# Uses each outcome's canonical bundle (best variant by NCSS kap_median)
+# Single shared color-ramp legend
+# Axis labels appear only on edge panels (left + bottom)
+# ============================================================
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(here)
+
+fig_dir <- here("outputs", "figures_05_02")
+
+thesis_theme <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# ============================================================
+# IDENTIFY BEST NCSS VARIANT PER OUTCOME (by kap_median)
+# ============================================================
+summary_clean <- read.csv(here("outputs", "reports_05_02",
+                                "test_metrics_summary_clean.csv"))
+
+best_ncss_per_outcome <- summary_clean %>%
+  group_by(outcome) %>%
+  slice_max(kap_median, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(bundle = paste(outcome, engine, space, sep = "_"))
+
+# For series, prefer the min_n=5 deployment-realistic version if available
+# (matches what the Perry figure shows). If the min_n=5 bundle isn't in
+# summary_clean, fall back to whatever is best.
+if ("taxonname_clean_min5_rf_plain" %in% list.files(here("outputs", "models_05_02"),
+                                                     pattern = "_bundle\\.rds$") %>%
+    str_remove("_bundle\\.rds$")) {
+  # Use min5 if you want deployment parity with Perry; otherwise leave as-is
+  # Uncomment if desired:
+  # best_ncss_per_outcome <- best_ncss_per_outcome %>%
+  #   mutate(bundle = if_else(outcome == "taxonname_clean",
+  #                            paste0(bundle, "_min5_rf_plain"),
+  #                            bundle))
+}
+
+cat("Best NCSS variant per outcome:\n")
+print(best_ncss_per_outcome %>% select(outcome, engine, space, bundle, kap_median))
+
+# ============================================================
+# LOAD BUNDLES + BUILD CM DATA
+# ============================================================
+ncss_cm_plots <- list()
+
+for (i in seq_len(nrow(best_ncss_per_outcome))) {
+  oc <- best_ncss_per_outcome$outcome[i]
+  bn <- best_ncss_per_outcome$bundle[i]
+
+  bundle_path <- here("outputs", "models_05_02", paste0(bn, "_bundle.rds"))
+  if (!file.exists(bundle_path)) {
+    cat("Missing bundle for", oc, ":", basename(bundle_path), "\n")
+    next
+  }
+
+  b <- readRDS(bundle_path)
+  if (is.null(b$conf_mat)) {
+    cat("No conf_mat in bundle for", oc, "\n")
+    next
+  }
+
+  # Extract confusion matrix as long data
+cm_df <- as.data.frame(b$conf_mat$table) %>%
+    rename(truth_fct = Truth, pred_fct = Prediction, n = Freq) %>%
+    group_by(truth_fct) %>%
+    mutate(
+      row_total = sum(n),
+      prop = if (row_total[1] == 0) 0 else n / row_total[1]
+    ) %>%
+    ungroup() %>%
+    select(-row_total)
+
+  # Class ordering: most common truth at top of y-axis
+  class_order <- cm_df %>%
+    group_by(truth_fct) %>%
+    summarise(total = sum(n), .groups = "drop") %>%
+    arrange(total) %>%
+    pull(truth_fct) %>% as.character()
+
+  all_classes <- union(as.character(unique(cm_df$truth_fct)),
+                       as.character(unique(cm_df$pred_fct)))
+  x_order <- c(intersect(class_order, all_classes),
+               setdiff(all_classes, class_order))
+
+  cm_df <- cm_df %>%
+    mutate(
+      truth_fct = factor(as.character(truth_fct), levels = class_order),
+      pred_fct  = factor(as.character(pred_fct),  levels = x_order)
+    )
+
+  # Determine which axis labels to show based on position in the 3x2 grid
+  # Position in tax_order: 1, 2, 3, 4, 5, 6
+  # 2-column grid:
+  #   row 1: outcomes 1, 2   -> bottom panels = NO (only show y-axis label)
+  #   row 2: outcomes 3, 4   -> not edge
+  #   row 3: outcomes 5, 6   -> bottom row (show x-axis label)
+  # Y-axis label shown only on left column (odd positions)
+  pos_in_order <- which(tax_order == oc)
+  is_left_col   <- (pos_in_order %% 2) == 1   # 1, 3, 5
+  is_bottom_row <- pos_in_order %in% c(5, 6)
+
+  p <- ggplot(cm_df, aes(x = pred_fct, y = truth_fct, fill = prop)) +
+    geom_tile(color = "white", linewidth = 0.3) +
+    geom_text(aes(label = ifelse(n > 0, n, "")), size = 6) +
+    scale_fill_gradient(low = "white", high = "#2C7BB6",
+                        limits = c(0, 1),
+                        name = "Row prop") +
+    labs(
+      title = tax_labels[oc],
+      x = if (is_bottom_row) "Predicted class" else NULL,
+      y = if (is_left_col)   "True class"      else NULL
+    ) +
+    thesis_theme +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+      axis.text.y = element_text(size = 10),
+      panel.grid = element_blank(),
+      plot.title = element_text(size = 11, face = "bold"),
+      legend.position = "right"
+    )
+
+  ncss_cm_plots[[oc]] <- p
+}
+
+cat("\nBuilt NCSS confusion-matrix plots for:",
+    paste(names(ncss_cm_plots), collapse = ", "), "\n")
+
+# ============================================================
+# COMBINE INTO PATCHWORK + ADD SHARED LEGEND
+# ============================================================
+ordered_cm_plots <- ncss_cm_plots[tax_order]
+ordered_cm_plots <- ordered_cm_plots[!sapply(ordered_cm_plots, is.null)]
+
+# Extract the shared legend from the first plot (before stripping legends)
+shared_legend_cm <- cowplot::get_legend(ordered_cm_plots[[1]])
+
+# Strip legend from every panel
+ordered_cm_plots_no_legend <- map(ordered_cm_plots, function(p) {
+  p + scale_fill_gradient(
+    low = "white", high = "#2C7BB6",
+    limits = c(0, 1),
+    guide = "none"
+  )
+})
+
+# Build 2-column patchwork
+cm_panels <- wrap_plots(ordered_cm_plots_no_legend, ncol = 2) +
+  plot_annotation(
+    title = "NCSS confusion matrices across taxonomic levels",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+# Combine panels + shared legend horizontally
+fig_ncss_cm <- cowplot::plot_grid(
+  cm_panels, shared_legend_cm,
+  ncol = 2,
+  rel_widths = c(1, 0.08)
+)
+
+print(fig_ncss_cm)
+ggsave(file.path(fig_dir, "fig_ncss_confusion_matrices.png"),
+       fig_ncss_cm, width = 16, height = 15, dpi = 300)
+
+cat("\nSaved: fig_ncss_confusion_matrices_05_15_2026.png\n")
+```
+
+
+

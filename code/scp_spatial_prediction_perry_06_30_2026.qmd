@@ -1,0 +1,11 @@
+---
+title: "scp_spatial_prediction_perry_06_30_2026"
+format: html
+---
+
+```{r packages, message=FALSE, warning=FALSE}
+#load packages
+library(tidyverse)
+
+```
+

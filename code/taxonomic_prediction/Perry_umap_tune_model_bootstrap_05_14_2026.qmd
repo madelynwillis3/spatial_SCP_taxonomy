@@ -1,0 +1,2108 @@
+---
+title: "Perry_model_boostrap_05_14_2026"
+format: html
+---
+
+
+```{r setup}
+library(beepr)
+source("../code/modeling_functions_05_02_2026.R")
+source("../code/pedon_pack_functions_05_02_2026.R")
+
+
+```
+
+```{r load-data}
+# ============================================================
+# LOAD PERRY PACK + CLEANED HORIZON DATA + BUNDLES
+# ============================================================
+
+# --- Most recent Perry pack ---
+perry_pack_files <- list.files("../outputs",
+                               pattern = "^perry_pack_150_.*\\.csv$",
+                               full.names = TRUE)
+perry_pack_path <- perry_pack_files[which.max(file.mtime(perry_pack_files))]
+cat("Loading Perry pack:", perry_pack_path, "\n")
+
+perry_pack_150 <- read.csv(perry_pack_path) %>%
+  mutate(
+    peiid = as.character(peiid),
+    POINT_X = as.numeric(POINT_X),  # force numeric (NA -> NA_real_)
+    POINT_Y = as.numeric(POINT_Y)
+  )
+
+# --- Most recent cleaned Perry FP (for truth labels) ---
+perry_fp_files <- list.files("../outputs",
+                             pattern = "^perry_fp_clean_.*\\.csv$",
+                             full.names = TRUE)
+perry_fp_path <- perry_fp_files[which.max(file.mtime(perry_fp_files))]
+cat("Loading Perry FP clean:", perry_fp_path, "\n")
+
+perry_fp_clean <- read.csv(perry_fp_path) %>%
+  mutate(peiid = as.character(Point))
+
+# # --- All available NCSS bundles ---
+# bundle_files <- list.files("../outputs/models_05_02",
+#                            pattern = "_bundle\\.rds$",
+#                            full.names = TRUE)
+# 
+# # Filter out the legacy taxsubgrp bundle (different outcome name from taxsubgrp_mod1).
+# bundle_files <- bundle_files[
+#   basename(bundle_files) != "taxsubgrp_xgb_plain_bundle.rds"
+# ]
+# 
+# cat("Found", length(bundle_files), "bundles\n")
+
+bundle_files <- list.files("../outputs/models_05_02",
+                           pattern = "_bundle\\.rds$",
+                           full.names = TRUE)
+
+# Exclude legacy taxsubgrp and replicate-tagged bundles
+bundle_files <- bundle_files[
+  basename(bundle_files) != "taxsubgrp_xgb_plain_bundle.rds" &
+  !str_detect(basename(bundle_files), "_rep[0-9]+_bundle\\.rds$")
+]
+
+cat("Found", length(bundle_files), "canonical bundles\n")
+
+bundles <- map(bundle_files, readRDS) %>%
+  set_names(map_chr(., "name"))
+
+# --- Reattach UMAP fits where needed ---
+bundles <- map(bundles, function(b) {
+  if ((b$model_type %||% "") == "umap_hdb") {
+    raw_path <- b$umap_model_file %||% ""
+    candidate_paths <- unique(c(
+      raw_path,
+      sub("^\\.\\./", "", raw_path),
+      file.path(getwd(), raw_path),
+      file.path(getwd(), sub("^\\.\\./", "", raw_path))
+    ))
+    candidate_paths <- candidate_paths[file.exists(candidate_paths)]
+    if (length(candidate_paths) == 0) {
+      warning("UMAP file not found for ", b$name, " (was: ", raw_path, ")")
+      return(b)
+    }
+    b$umap_fit <- uwot::load_uwot(candidate_paths[1])
+  }
+  b
+})
+```
+
+```{r bundle-inventory}
+# ============================================================
+# BUNDLE INVENTORY
+# ============================================================
+
+bundle_inventory <- map_dfr(bundles, function(b) {
+  tibble(
+    name        = b$name,
+    outcome     = b$outcome,
+    model_type  = b$model_type,
+    has_umap    = !is.null(b$umap_fit),
+    n_train     = nrow(b$train_raw),
+    n_classes   = if (!is.null(b$train_raw[[b$outcome]])) {
+      length(unique(b$train_raw[[b$outcome]]))
+    } else NA_integer_,
+    test_kap    = b$test_metrics$kap %||% NA_real_,
+    test_bal_acc= b$test_metrics$bal_accuracy %||% NA_real_,
+    test_topk   = b$test_metrics$top_k %||% NA_real_
+  )
+})
+
+cat("\n--- Bundle inventory ---\n")
+print(bundle_inventory, n = Inf)
+
+write.csv(bundle_inventory,
+          "../outputs/reports_05_02/perry_bundle_inventory.csv",
+          row.names = FALSE)
+```
+
+```{r domain-shift}
+# ============================================================
+# DOMAIN-SHIFT DIAGNOSTIC
+# Train a binary classifier (NCSS vs Perry) on baked features.
+# Runs once, using the taxorder rf_plain bundle's recipe.
+# Interpretation:
+#   acc < 0.6  : low shift (good)
+#   0.6 - 0.75 : moderate shift
+#   > 0.75     : strong shift; predictions need care
+# ============================================================
+
+ds_bundle <- bundles$taxorder_rf_plain
+
+if (!is.null(ds_bundle)) {
+
+  ncss_baked <- bake(ds_bundle$prep_rec, new_data = ds_bundle$train_raw) %>%
+    select(-any_of(c(ds_bundle$outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric))
+
+  perry_padded <- pad_like_train_raw(perry_pack_150, ds_bundle$train_raw,
+                                     ds_bundle$outcome)
+  perry_baked <- bake(ds_bundle$prep_rec, new_data = perry_padded) %>%
+    select(-any_of(c(ds_bundle$outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric))
+
+  ds_result <- domain_shift_check(ncss_baked, perry_baked, seed = 42)
+
+  cat("\n========================================\n")
+  cat("DOMAIN-SHIFT DIAGNOSTIC\n")
+  cat("========================================\n")
+  cat("Binary classifier (NCSS vs Perry) accuracy:",
+      round(ds_result$accuracy, 3), "\n")
+  cat("Interpretation:", ds_result$interpretation, "\n")
+  cat("\nTop features distinguishing NCSS from Perry:\n")
+  print(ds_result$top_features)
+
+  saveRDS(ds_result, "../outputs/reports_05_02/domain_shift_result.rds")
+} else {
+  message("No taxorder_rf_plain bundle found — skipping domain shift check.")
+  ds_result <- NULL
+}
+```
+
+```{r build-truth}
+# ============================================================
+# BUILD PERRY PER-PEDON TRUTH LABELS
+# ============================================================
+
+build_perry_truth <- function(perry_fp_clean, truth_col) {
+  truth_col <- rlang::as_name(rlang::ensym(truth_col))
+
+  if (!truth_col %in% names(perry_fp_clean)) {
+    return(tibble(peiid = character(), truth = character(),
+                  n_truth_unique = integer()))
+  }
+
+  dat <- perry_fp_clean %>%
+    mutate(truth_val = na_if(str_squish(as.character(.data[[truth_col]])), ""))
+
+  # Match NCSS conventions
+  if (truth_col == "taxpartsize") {
+    dat <- dat %>% mutate(truth_val = str_to_lower(truth_val))
+  }
+  if (truth_col == "series_clean") {
+    dat <- dat %>% mutate(truth_val = na_if(truth_val, "Fill")) %>%
+                   mutate(truth_val = na_if(truth_val, "fill")) %>%
+                   mutate(truth_val = str_to_title(truth_val))
+  }
+
+  dat %>%
+    group_by(peiid) %>%
+    summarise(
+      n_hz = n(),
+      n_truth_nonNA = sum(!is.na(truth_val)),
+      n_truth_unique = n_distinct(truth_val[!is.na(truth_val)]),
+      truth = {
+        nv <- truth_val[!is.na(truth_val)]
+        if (length(nv) == 0) NA_character_ else
+          names(sort(table(nv), decreasing = TRUE))[1]
+      },
+      .groups = "drop"
+    )
+}
+
+# Map outcome name -> truth column in perry_fp_clean
+truth_col_map <- c(
+  taxorder        = "taxorder",
+  taxsuborder     = "taxsuborder",
+  taxgrtgroup     = "taxgrtgroup",
+  taxsubgrp_mod1  = "taxsubgrp_mod1",
+  taxpartsize     = "taxpartsize",
+  taxonname_clean = "series_clean"
+)
+
+perry_truth <- map(truth_col_map, ~ build_perry_truth(perry_fp_clean, !!sym(.x))) %>%
+  set_names(names(truth_col_map))
+
+cat("\n--- Perry truth coverage ---\n")
+walk2(perry_truth, names(perry_truth), function(t, nm) {
+  n_with_truth <- sum(!is.na(t$truth) & t$n_truth_unique == 1)
+  cat(nm, ": ", n_with_truth, " / ", nrow(t),
+      " pedons with unambiguous truth\n", sep = "")
+})
+```
+
+```{r deploy}
+# ============================================================
+# DEPLOY EVERY BUNDLE TO PERRY
+# ============================================================
+
+cat("\n========================================\n")
+cat("DEPLOYING BUNDLES TO PERRY\n")
+cat("========================================\n")
+
+perry_preds <- map(bundles, function(b) {
+  cat("  -- ", b$name, "\n")
+  tryCatch(
+    deploy_bundle_to_new(b, perry_pack_150) %>%
+      mutate(peiid = as.character(peiid)),
+    error = function(e) {
+      cat("     ERROR:", e$message, "\n")
+      NULL
+    }
+  )
+})
+
+# Drop bundles that failed
+perry_preds <- compact(perry_preds)
+
+# Long-format predictions table for export
+perry_preds_long <- map_dfr(perry_preds, function(pr) {
+  pr %>%
+    select(peiid, model_name, outcome, model_type, .pred_class, top1, margin)
+})
+
+cat("\nTotal pedon-by-model predictions: ", nrow(perry_preds_long), "\n")
+
+write.csv(perry_preds_long,
+          "../outputs/reports_05_02/perry_predictions_long.csv",
+          row.names = FALSE)
+```
+
+```{r validate}
+# ============================================================
+# VALIDATE PREDICTIONS AGAINST PERRY TRUTH
+# ============================================================
+
+validate_one_bundle <- function(pred_df, truth_df, outcome) {
+  pred_df  <- pred_df  %>% mutate(peiid = as.character(peiid))
+  truth_df <- truth_df %>% mutate(peiid = as.character(peiid))
+
+  joined <- pred_df %>%
+    left_join(truth_df %>% select(peiid, truth, n_truth_unique), by = "peiid") %>%
+    filter(!is.na(truth), n_truth_unique == 1)
+
+  if (nrow(joined) < 2) {
+    return(list(data = joined, metrics = NULL, conf_mat = NULL,
+                n_pedons = nrow(joined)))
+  }
+
+  # Union of all classes seen in truth, predictions, and bundle's training set
+  # (the prob columns tell us what the model knows about).
+  prob_cols <- names(joined)[
+    str_detect(names(joined), "^\\.pred_") & names(joined) != ".pred_class"
+  ]
+  trained_classes <- str_remove(prob_cols, "^\\.pred_")
+
+  lvl <- union(union(
+    as.character(unique(joined$truth)),
+    as.character(unique(joined$.pred_class))
+  ), trained_classes)
+
+  joined <- joined %>%
+    mutate(
+      truth_fct   = factor(truth, levels = lvl),
+      pred_fct    = factor(as.character(.pred_class), levels = lvl),
+      .pred_class = pred_fct  # overwrite so downstream metric calls also see matched levels
+    )
+
+  # All metrics computed on the harmonized factors
+  k_for_topk <- if (outcome == "taxonname_clean") 5 else 3
+
+# Replace the existing 'mets <- tibble(...)' block in validate_one_bundle with:
+
+# Only score classes actually present in Perry truth
+present_in_truth <- as.character(unique(joined$truth_fct))
+joined_present <- joined %>%
+  filter(as.character(truth_fct) %in% present_in_truth) %>%
+  mutate(
+    truth_fct = factor(as.character(truth_fct), levels = present_in_truth),
+    pred_fct  = factor(
+      as.character(pred_fct),
+      levels = union(present_in_truth, as.character(unique(pred_fct)))
+    )
+  )
+
+# For bal_accuracy/f_meas, restrict to a "fair" comparison universe:
+# truth-present classes plus any class actually predicted.
+fair_lvls <- union(present_in_truth, as.character(unique(joined_present$pred_fct)))
+joined_fair <- joined_present %>%
+  mutate(
+    truth_fct = factor(as.character(truth_fct), levels = fair_lvls),
+    pred_fct  = factor(as.character(pred_fct),  levels = fair_lvls)
+  )
+
+k_for_topk <- if (outcome == "taxonname_clean") 5 else 3
+
+mets <- tibble(
+  accuracy     = accuracy(joined, truth = truth_fct, estimate = pred_fct)$.estimate,
+  kap          = kap(joined,      truth = truth_fct, estimate = pred_fct)$.estimate,
+  bal_accuracy = suppressWarnings(
+    bal_accuracy(joined_fair, truth = truth_fct, estimate = pred_fct)$.estimate
+  ),
+  f_meas_macro = suppressWarnings(
+    f_meas(joined_fair, truth = truth_fct, estimate = pred_fct,
+           estimator = "macro")$.estimate
+  ),
+  top_k        = top_k_accuracy(joined, "truth_fct", k = k_for_topk),
+  k            = k_for_topk,
+  n_truth_classes      = length(present_in_truth),
+  n_predicted_classes  = length(unique(as.character(joined$pred_fct))),
+  n_trained_classes    = length(unique(c(present_in_truth,
+                                          str_remove(prob_cols, "^\\.pred_"))))
+)
+
+  cm <- conf_mat(joined, truth = truth_fct, estimate = pred_fct)
+
+  list(
+    data     = joined,
+    metrics  = mets,
+    conf_mat = cm,
+    n_pedons = nrow(joined)
+  )
+}
+
+perry_validations <- list()
+
+for (nm in names(perry_preds)) {
+  b <- bundles[[nm]]
+  oc <- b$outcome
+
+  # series bundles use "taxonname_clean" outcome but truth from "series_clean"
+  truth_key <- oc
+
+  truth_df <- perry_truth[[truth_key]]
+  if (is.null(truth_df) || nrow(truth_df) == 0) {
+    cat(nm, ": no truth available (skipping)\n")
+    next
+  }
+
+  v <- validate_one_bundle(perry_preds[[nm]], truth_df, oc)
+  perry_validations[[nm]] <- v
+}
+
+# ---- Summary ----
+perry_metric_summary <- map_dfr(perry_validations, function(v) {
+  if (is.null(v$metrics)) return(NULL)
+  v$metrics %>% mutate(n_pedons = v$n_pedons)
+}, .id = "bundle")
+
+# Add outcome column for grouping
+perry_metric_summary <- perry_metric_summary %>%
+  mutate(
+    outcome = bundle %>%
+      str_remove("_rf_plain$|_xgb_plain$|_rf_umap_hdb$|_xgb_umap_hdb$|_rf_umap_hdb_tuned$|_xgb_umap_hdb_tuned$") %>%
+      str_remove("_min5$"),
+    is_min5 = str_detect(bundle, "_min5_"),
+    engine = case_when(
+      str_detect(bundle, "_rf_")  ~ "rf",
+      str_detect(bundle, "_xgb_") ~ "xgb"
+    ),
+    space = case_when(
+      str_detect(bundle, "_umap_hdb_tuned$") ~ "umap_hdb_tuned",
+      str_detect(bundle, "_umap_hdb$")       ~ "umap_hdb",
+      TRUE                                    ~ "plain"
+    )
+  ) %>%
+  select(outcome, engine, space, is_min5, bundle, n_pedons,
+         accuracy, kap, bal_accuracy, f_meas_macro, top_k, k)
+
+cat("\n========================================\n")
+cat("PERRY EXTERNAL VALIDATION SUMMARY\n")
+cat("========================================\n")
+print(perry_metric_summary %>% arrange(outcome, desc(kap)), n = Inf)
+
+write.csv(perry_metric_summary,
+          "../outputs/reports_05_02/perry_external_validation.csv",
+          row.names = FALSE)
+```
+
+
+
+```{r per-class-and-confusion}
+# ============================================================
+# PER-CLASS ACCURACY + CONFUSION PAIRS
+# ============================================================
+
+per_class_acc <- function(joined_df) {
+  joined_df %>%
+    mutate(across(c(truth_fct, pred_fct), as.character)) %>%
+    group_by(truth_fct) %>%
+    summarise(
+      n         = n(),
+      n_correct = sum(truth_fct == pred_fct),
+      acc       = round(n_correct / n, 3),
+      .groups   = "drop"
+    ) %>%
+    arrange(desc(n))
+}
+
+confusion_pairs <- function(joined_df) {
+  joined_df %>%
+    mutate(across(c(truth_fct, pred_fct), as.character)) %>%
+    filter(truth_fct != pred_fct) %>%
+    count(truth_fct, pred_fct, sort = TRUE)
+}
+
+# Pick best Perry-side bundle per outcome (by kap), then dump details
+best_perry_bundle <- perry_metric_summary %>%
+  group_by(outcome) %>%
+  slice_max(kap, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("\n========================================\n")
+cat("BEST PERRY-SIDE BUNDLE PER OUTCOME (by kap)\n")
+cat("========================================\n")
+print(best_perry_bundle)
+
+for (i in seq_len(nrow(best_perry_bundle))) {
+  bn <- best_perry_bundle$bundle[i]
+  oc <- best_perry_bundle$outcome[i]
+
+  v <- perry_validations[[bn]]
+  if (is.null(v) || is.null(v$data)) next
+
+  cat("\n----- ", bn, " (", oc, ") -----\n", sep = "")
+
+  cat("\nPer-class:\n")
+  print(per_class_acc(v$data))
+
+  cat("\nTop misclassification pairs:\n")
+  cp <- confusion_pairs(v$data)
+  if (nrow(cp) > 0) print(cp %>% slice_head(n = 10)) else cat("(none)\n")
+}
+```
+
+```{r hierarchical-accuracy}
+# ============================================================
+# HIERARCHICAL-PARENT ACCURACY
+# "When the child outcome was wrong, was the parent outcome right?"
+# Useful for: subgroup_mod1 (parent=great group),
+#             great group (parent=suborder),
+#             suborder (parent=order),
+#             series (parent=subgroup_mod1).
+# ============================================================
+
+# Use the BEST Perry-side bundle per outcome (already computed)
+best_per_outcome <- best_perry_bundle %>%
+  select(outcome, bundle)
+
+perry_pred_wide <- perry_preds_long %>%
+  filter(model_name %in% best_per_outcome$bundle) %>%
+  mutate(.pred_class = as.character(.pred_class)) %>%
+  # Force one row per (peiid, outcome) - take the first if duplicates
+  arrange(peiid, outcome) %>%
+  distinct(peiid, outcome, .keep_all = TRUE) %>%
+  select(peiid, outcome, .pred_class) %>%
+  pivot_wider(
+    id_cols = peiid,
+    names_from = outcome,
+    values_from = .pred_class,
+    names_prefix = "pred_",
+    values_fill = NA_character_
+  )
+
+# Verify column types
+cat("Column types after pivot_wider:\n")
+print(sapply(perry_pred_wide, class))
+
+# Wide table: peiid x outcome -> truth class
+perry_truth_wide <- imap_dfr(perry_truth, function(t, nm) {
+  if (nrow(t) == 0) return(NULL)
+  t %>% mutate(outcome = nm) %>%
+    filter(!is.na(truth), n_truth_unique == 1) %>%
+    select(peiid, outcome, truth)
+}) %>%
+  pivot_wider(names_from = outcome, values_from = truth,
+              names_prefix = "truth_")
+
+# Join
+hier <- perry_pred_wide %>%
+  left_join(perry_truth_wide, by = "peiid")
+
+# Compute parent-correct given child-incorrect
+hier_pairs <- list(
+  list(child = "taxonname_clean", parent = "taxsubgrp_mod1"),
+  list(child = "taxsubgrp_mod1",  parent = "taxgrtgroup"),
+  list(child = "taxgrtgroup",     parent = "taxsuborder"),
+  list(child = "taxsuborder",     parent = "taxorder")
+)
+
+hier_acc <- map_dfr(hier_pairs, function(pr) {
+  pred_c <- paste0("pred_",  pr$child)
+  truth_c <- paste0("truth_", pr$child)
+  pred_p <- paste0("pred_",  pr$parent)
+  truth_p <- paste0("truth_", pr$parent)
+
+  needed <- c(pred_c, truth_c, pred_p, truth_p)
+  if (!all(needed %in% names(hier))) return(NULL)
+
+  d <- hier %>%
+    select(all_of(needed)) %>%
+    rename(pred_child = !!pred_c, truth_child = !!truth_c,
+           pred_parent = !!pred_p, truth_parent = !!truth_p) %>%
+    filter(!is.na(truth_child), !is.na(truth_parent))
+
+  if (nrow(d) == 0) return(NULL)
+
+  d <- d %>%
+    mutate(
+      child_correct  = as.character(pred_child)  == as.character(truth_child),
+      parent_correct = as.character(pred_parent) == as.character(truth_parent)
+    )
+tibble(
+    child = pr$child,
+    parent = pr$parent,
+    n = nrow(d),
+    child_acc  = mean(d$child_correct,  na.rm = TRUE),
+    parent_acc = mean(d$parent_correct, na.rm = TRUE),
+    parent_acc_when_child_wrong =
+      if (any(!d$child_correct, na.rm = TRUE))
+        mean(d$parent_correct[!d$child_correct], na.rm = TRUE)
+      else NA_real_,
+    both_correct = mean(d$child_correct & d$parent_correct, na.rm = TRUE)
+  )
+})
+
+cat("\n========================================\n")
+cat("HIERARCHICAL-PARENT ACCURACY\n")
+cat("Read 'parent_acc_when_child_wrong' as:\n")
+cat("  When the model misses the child class, how often does it\n")
+cat("  still get the parent (less specific) class right?\n")
+cat("========================================\n")
+print(hier_acc)
+
+write.csv(hier_acc,
+          "../outputs/reports_05_02/perry_hierarchical_accuracy.csv",
+          row.names = FALSE)
+```
+
+
+```{r rhodic-diagnostic}
+
+# ============================================================
+# RHODIC-SPECIFIC FAILURE ANALYSIS
+# Why are 0/40 true Rhodic pedons predicted as Rhodic?
+# Was Rhodic the close runner-up, or completely absent from
+# the model's consideration?
+# ============================================================
+
+# 1) Get the best Perry-side subgroup_mod1 bundle and its predictions
+sub_bundle_name <- best_perry_bundle %>%
+  filter(outcome == "taxsubgrp_mod1") %>%
+  pull(bundle)
+
+if (length(sub_bundle_name) == 0) {
+  message("No taxsubgrp_mod1 bundle for Rhodic diagnostic.")
+} else {
+
+  sub_pred <- perry_preds[[sub_bundle_name]]
+  sub_truth <- perry_truth$taxsubgrp_mod1
+
+  # 2) Join with truth, keep only true Rhodic pedons
+  rhodic_pedons <- sub_pred %>%
+    mutate(peiid = as.character(peiid)) %>%
+    left_join(
+      sub_truth %>% mutate(peiid = as.character(peiid)) %>%
+        select(peiid, truth, n_truth_unique),
+      by = "peiid"
+    ) %>%
+    filter(!is.na(truth), n_truth_unique == 1, truth == "Rhodic")
+
+  cat("\n========================================\n")
+  cat("RHODIC FAILURE DIAGNOSTIC\n")
+  cat("Bundle:", sub_bundle_name, "\n")
+  cat("True Rhodic pedons:", nrow(rhodic_pedons), "\n")
+  cat("========================================\n")
+
+  # 3) Where did Rhodic rank in the predicted probabilities?
+  prob_cols <- names(rhodic_pedons)[
+    str_detect(names(rhodic_pedons), "^\\.pred_") &
+      names(rhodic_pedons) != ".pred_class"
+  ]
+  class_names <- str_remove(prob_cols, "^\\.pred_")
+  
+  rhodic_rank_summary <- map_dfr(seq_len(nrow(rhodic_pedons)), function(i) {
+    probs <- as.numeric(rhodic_pedons[i, prob_cols])
+    names(probs) <- class_names
+  
+    sorted <- sort(probs, decreasing = TRUE)
+  
+    # GUARD: if Rhodic isn't in the model's classes, return NA gracefully
+    rhodic_prob <- if ("Rhodic" %in% names(probs)) probs[["Rhodic"]] else NA_real_
+    rhodic_rank <- if ("Rhodic" %in% names(probs)) which(names(sorted) == "Rhodic") else integer(0)
+  
+    tibble(
+      peiid           = rhodic_pedons$peiid[i],
+      predicted_class = as.character(rhodic_pedons$.pred_class[i]),
+      pred_top1_prob  = sorted[1],
+      pred_top1_class = names(sorted)[1],
+      rhodic_prob     = rhodic_prob,
+      rhodic_rank     = if (length(rhodic_rank) > 0) rhodic_rank else NA_integer_,
+      margin_top1_minus_rhodic = sorted[1] - (rhodic_prob %||% NA_real_)
+    )
+  })
+
+  cat("\n--- Where did Rhodic rank? ---\n")
+  rhodic_rank_summary %>%
+    count(rhodic_rank, name = "n_pedons") %>%
+    mutate(rank_label = case_when(
+      rhodic_rank == 1 ~ "1st (correct)",
+      rhodic_rank == 2 ~ "2nd (close miss)",
+      rhodic_rank == 3 ~ "3rd",
+      rhodic_rank == 4 ~ "4th",
+      rhodic_rank >= 5 ~ "5th+",
+      TRUE ~ "unknown"
+    )) %>%
+    select(rank_label, n_pedons) %>%
+    print()
+
+  cat("\n--- Distribution of Rhodic probability when wrong ---\n")
+  print(summary(rhodic_rank_summary$rhodic_prob))
+
+  cat("\n--- Confidence in Typic when truth is Rhodic ---\n")
+  rhodic_rank_summary %>%
+    filter(predicted_class == "Typic") %>%
+    summarise(
+      n               = n(),
+      mean_typic_prob = round(mean(pred_top1_prob, na.rm = TRUE), 3),
+      mean_rhodic_prob= round(mean(rhodic_prob,    na.rm = TRUE), 3),
+      mean_margin     = round(mean(margin_top1_minus_rhodic, na.rm = TRUE), 3),
+      n_high_conf     = sum(pred_top1_prob > 0.7, na.rm = TRUE),
+      n_low_conf      = sum(pred_top1_prob < 0.5, na.rm = TRUE)
+    ) %>%
+    print()
+
+  # 4) Compare features: Perry's true Rhodics vs NCSS's true Rhodics
+  ncss_rhodic <- bundles[[sub_bundle_name]]$train_raw %>%
+    filter(taxsubgrp_mod1 == "Rhodic") %>%
+    select(any_of(c("R_w", "G_w", "B_w", "clay_w", "sand_w", "silt_w",
+                    "depth_to_Bt_cm", "bt_thickness_cm",
+                    "max_clay_ratio_0_150", "max_clay_delta_0_150")))
+
+  perry_rhodic <- perry_pack_150 %>%
+    filter(peiid %in% rhodic_pedons$peiid) %>%
+    select(any_of(names(ncss_rhodic)))
+
+  cat("\n--- Feature comparison: NCSS Rhodics vs Perry Rhodics ---\n")
+  feat_compare <- map_dfr(names(ncss_rhodic), function(nm) {
+    n_vals <- ncss_rhodic[[nm]]
+    p_vals <- perry_rhodic[[nm]]
+    tibble(
+      feature       = nm,
+      ncss_n        = sum(!is.na(n_vals)),
+      perry_n       = sum(!is.na(p_vals)),
+      ncss_median   = round(median(n_vals,  na.rm = TRUE), 3),
+      perry_median  = round(median(p_vals,  na.rm = TRUE), 3),
+      ncss_iqr      = round(IQR(n_vals,     na.rm = TRUE), 3),
+      perry_iqr     = round(IQR(p_vals,     na.rm = TRUE), 3),
+      median_shift  = round(median(p_vals, na.rm = TRUE) -
+                              median(n_vals, na.rm = TRUE), 3)
+    )
+  }) %>%
+    arrange(desc(abs(median_shift)))
+
+  print(feat_compare)
+
+  # 5) For comparison: Perry's NON-Rhodic (Typic) pedons - are Perry Rhodics
+  #    closer to NCSS Rhodics or to Perry Typics?
+  perry_typic <- perry_pack_150 %>%
+    inner_join(
+      sub_truth %>% mutate(peiid = as.character(peiid)) %>%
+        filter(truth == "Typic", n_truth_unique == 1) %>%
+        select(peiid),
+      by = "peiid"
+    ) %>%
+    select(any_of(names(ncss_rhodic)))
+
+  cat("\n--- Three-way: NCSS Rhodics, Perry Rhodics, Perry Typics (medians) ---\n")
+  three_way <- map_dfr(names(ncss_rhodic), function(nm) {
+    tibble(
+      feature           = nm,
+      ncss_rhodic_med   = round(median(ncss_rhodic[[nm]],  na.rm = TRUE), 3),
+      perry_rhodic_med  = round(median(perry_rhodic[[nm]], na.rm = TRUE), 3),
+      perry_typic_med   = round(median(perry_typic[[nm]],  na.rm = TRUE), 3)
+    ) %>%
+      mutate(
+        # Is Perry Rhodic closer to NCSS Rhodic or to Perry Typic?
+        dist_to_ncss_rhodic = abs(perry_rhodic_med - ncss_rhodic_med),
+        dist_to_perry_typic = abs(perry_rhodic_med - perry_typic_med),
+        closer_to = if_else(dist_to_ncss_rhodic < dist_to_perry_typic,
+                            "NCSS Rhodic", "Perry Typic")
+      )
+  })
+  print(three_way)
+
+  # Save outputs
+  write.csv(rhodic_rank_summary,
+            "../outputs/reports_05_02/rhodic_rank_diagnostic.csv",
+            row.names = FALSE)
+  write.csv(feat_compare,
+            "../outputs/reports_05_02/rhodic_feature_comparison.csv",
+            row.names = FALSE)
+  write.csv(three_way,
+            "../outputs/reports_05_02/rhodic_three_way_comparison.csv",
+            row.names = FALSE)
+
+  cat("\nRhodic diagnostics saved to ../outputs/reports_05_02/\n")
+}
+
+#So Perry's Rhodics are taxonomically Rhodic but morphologically unusual compared to NCSS Rhodics — they have much more pronounced argillic/kandic features, which the model maps to non-Rhodic categories. Perry Rhodics are at the extreme end of clay translocation that NCSS Rhodics don't reach, so the model misroutes them.
+#1/39 correct, but Rhodic ranked 2nd or 3rd for 25/39 pedons. Mean Rhodic probability = 0.125 when wrong. Three-way feature comparison shows Perry Rhodics are morphologically more extreme than NCSS Rhodics: clay 47% vs 38%, max_clay_ratio 11 vs 2.6, max_clay_delta 62 vs 26. The model "knows" about Rhodic but its NCSS-trained representation of Rhodic doesn't extend to Perry's extreme clay translocation.
+
+```
+
+
+
+```{r combined-thesis-summary}
+
+# ============================================================
+# COMBINED NCSS + PERRY SUMMARY (THESIS-READY)
+# ============================================================
+
+# NCSS internal results (from saved test metrics in bundles)
+ncss_internal <- map_dfr(bundles, function(b) {
+  if (is.null(b$test_metrics)) return(NULL)
+  b$test_metrics %>%
+    mutate(bundle = b$name, outcome = b$outcome,
+           dataset = "NCSS (internal test)")
+})
+
+# Perry external results
+perry_external <- perry_metric_summary %>%
+  mutate(dataset = "Perry (external)") %>%
+  select(bundle, outcome, dataset, accuracy, kap, bal_accuracy,
+         f_meas_macro, top_k, k, n_pedons)
+
+# Stack
+combined <- bind_rows(
+  ncss_internal %>% select(bundle, outcome, dataset, accuracy, kap,
+                           bal_accuracy, f_meas_macro, top_k, k),
+  perry_external
+) %>%
+  mutate(
+    engine = case_when(
+      str_detect(bundle, "_rf_")  ~ "rf",
+      str_detect(bundle, "_xgb_") ~ "xgb"
+    ),
+    space = case_when(
+      str_detect(bundle, "_umap_hdb_tuned$") ~ "umap_hdb_tuned",
+      str_detect(bundle, "_umap_hdb$")       ~ "umap_hdb",
+      TRUE                                    ~ "plain"
+    ),
+    is_min5 = str_detect(bundle, "_min5_")
+  ) %>%
+  select(dataset, outcome, engine, space, is_min5, bundle,
+         accuracy, kap, bal_accuracy, f_meas_macro, top_k, k, n_pedons)
+
+cat("\n========================================\n")
+cat("COMBINED RESULTS: NCSS internal vs Perry external\n")
+cat("========================================\n")
+print(combined %>%
+        arrange(outcome, dataset, desc(kap)),
+      n = Inf)
+
+write.csv(combined,
+          "../outputs/reports_05_02/combined_ncss_perry_results_with_tune.csv",
+          row.names = FALSE)
+
+# ---- Pivoted "thesis table" view ----
+thesis_view <- combined %>%
+  filter(!is_min5) %>%
+  group_by(outcome, dataset) %>%
+  slice_max(kap, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(outcome, dataset, engine, space,
+         accuracy, kap, bal_accuracy, f_meas_macro, top_k) %>%
+  pivot_wider(
+    names_from = dataset,
+    values_from = c(accuracy, kap, bal_accuracy, f_meas_macro, top_k,
+                    engine, space)
+  )
+
+cat("\n--- THESIS-READY: best per outcome on each dataset ---\n")
+print(thesis_view, n = Inf)
+
+write.csv(thesis_view,
+          "../outputs/reports_05_02/thesis_summary_table_with_tune.csv",
+          row.names = FALSE)
+
+
+
+
+```
+
+```{r}
+# 
+# 
+# #combine with UMAP + tuning:
+# # Load existing NCSS + Perry results
+# existing_results <- read.csv(here("outputs", "reports_05_02",
+#                                    "combined_ncss_perry_results.csv"))
+# 
+# # Build "tuned UMAP" rows from sensitivity analysis
+# tuned_umap_rows <- sensitivity_full %>%
+#   filter(status == "ok") %>%
+#   group_by(outcome, engine) %>%
+#   slice_max(ncss_kap, n = 1, with_ties = FALSE) %>%
+#   ungroup() %>%
+#   # Two rows per outcome × engine — one for NCSS, one for Perry
+#   pivot_longer(cols = c(ncss_kap, perry_kap, ncss_acc, perry_acc),
+#                names_to = c("dataset_short", "metric"),
+#                names_sep = "_") %>%
+#   pivot_wider(names_from = metric, values_from = value) %>%
+#   mutate(
+#     dataset = if_else(dataset_short == "ncss",
+#                       "NCSS (internal test)", "Perry (external)"),
+#     space = "umap_hdb_tuned",   # distinct from plain umap_hdb
+#     is_min5 = FALSE,
+#     bundle = paste0(outcome, "_", engine, "_umap_tuned_nn",
+#                      n_neighbors, "_md", min_dist, "_mpts", minPts),
+#     bal_accuracy = NA_real_,
+#     f_meas_macro = NA_real_,
+#     top_k = NA_real_,
+#     k = NA_real_,
+#     n_pedons = NA_integer_
+#   ) %>%
+#   select(dataset, outcome, engine, space, is_min5, bundle,
+#          accuracy = acc, kap, bal_accuracy, f_meas_macro,
+#          top_k, k, n_pedons)
+# 
+# # Combine
+# combined_with_tuned <- bind_rows(existing_results, tuned_umap_rows)
+# 
+# write.csv(combined_with_tuned,
+#           here("outputs", "reports_05_02",
+#                 "combined_ncss_perry_with_tuned_umap.csv"),
+#           row.names = FALSE)
+```
+
+
+```{r done}
+
+cat("\n========================================\n")
+cat("DONE.\n")
+cat("Outputs written to ../outputs/reports_05_02/:\n")
+cat("- perry_bundle_inventory.csv\n")
+cat("- domain_shift_result.rds\n")
+cat("- perry_predictions_long.csv\n")
+cat("- perry_external_validation.csv\n")
+cat("- perry_hierarchical_accuracy.csv\n")
+cat("- combined_ncss_perry_results.csv\n")
+cat("- thesis_summary_table.csv\n")
+cat("========================================\n")
+beep("complete")
+```
+
+```{r figures!}
+# ============================================================
+# THESIS FIGURES
+# ============================================================
+library(ggplot2)
+library(tidyr)
+library(scales)
+
+fig_dir <- "../outputs/figures_05_02"
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Common theme
+thesis_theme <- theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey95", color = NA)
+  )
+
+# Order taxonomic levels from coarse to fine
+tax_order <- c("taxorder", "taxsuborder", "taxgrtgroup",
+               "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# Pull n_classes from bundle inventory
+n_classes_lookup <- bundle_inventory %>%
+  group_by(outcome) %>%
+  summarise(n_classes_max = max(n_classes, na.rm = TRUE), .groups = "drop")
+
+fig1_data <- combined %>%
+  filter(!is_min5) %>%
+  group_by(outcome, dataset) %>%
+  slice_max(kap, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(n_classes_lookup, by = "outcome") %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    dataset = factor(dataset, levels = c("NCSS (internal test)", "Perry (external)"))
+  )
+
+# n_classes label - one per outcome (top of bar group)
+n_class_labels <- fig1_data %>%
+  group_by(outcome) %>%
+  summarise(n_classes_max = first(n_classes_max),
+            ymax = max(kap, na.rm = TRUE), .groups = "drop")
+
+fig1 <- ggplot(fig1_data, aes(x = outcome, y = kap, fill = dataset)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = round(kap, 2)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3.2) +
+  geom_text(data = n_class_labels,
+            aes(x = outcome, y = 1.02, label = paste0("k=", n_classes_max)),
+            inherit.aes = FALSE, size = 3.4, fontface = "italic", color = "grey30") +
+  scale_fill_manual(values = c("NCSS (internal test)" = "#2C7BB6",
+                                "Perry (external)" = "#D7191C"),
+                    name = NULL) +
+  scale_y_continuous(limits = c(0, 1.08), expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "Cohen's Kappa",
+       title = "Model performance degrades from coarse to fine taxonomic levels",
+       subtitle = "Best-performing variant per outcome (k = number of classes)") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(fig1)
+ggsave(file.path(fig_dir, "fig1_kappa_by_level.png"),
+       fig1, width = 9, height = 5.5, dpi = 300)
+
+fig2_data <- hier_acc %>%
+  mutate(
+    pair_label = paste0(tax_labels[child], " → ", tax_labels[parent]),
+    # Reverse so coarse levels appear first on x-axis
+    pair_label = factor(pair_label, levels = rev(unique(pair_label)))
+  ) %>%
+  pivot_longer(cols = c(child_acc, parent_acc, parent_acc_when_child_wrong),
+               names_to = "metric", values_to = "value") %>%
+  mutate(
+    metric = recode(metric,
+                    child_acc = "Child correct",
+                    parent_acc = "Parent correct",
+                    parent_acc_when_child_wrong = "Parent correct when child wrong"),
+    metric = factor(metric, levels = c("Child correct", "Parent correct",
+                                        "Parent correct when child wrong"))
+  )
+
+fig2 <- ggplot(fig2_data, aes(x = pair_label, y = value, fill = metric)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = ifelse(is.na(value), "", round(value, 2))),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3) +
+  scale_fill_manual(values = c("Child correct" = "#2C7BB6",
+                                "Parent correct" = "#1A9641",
+                                "Parent correct when child wrong" = "#FDAE61"),
+                    name = NULL) +
+  scale_y_continuous(limits = c(0, 1.05), expand = c(0, 0)) +
+  labs(x = NULL, y = "Accuracy",
+       title = "Graceful degradation: parent class is recovered when child fails",
+       subtitle = "When the model misses the fine class, the level above is usually right") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+
+print(fig2)
+ggsave(file.path(fig_dir, "fig2_hierarchical_accuracy.png"),
+       fig2, width = 10, height = 5.5, dpi = 300)
+library(cowplot)
+
+# Reorder by tax_order
+ordered_cm_plots <- cm_plots[tax_order]
+ordered_cm_plots <- ordered_cm_plots[!sapply(ordered_cm_plots, is.null)]
+
+# Extract the legend from the first plot
+shared_legend_cm <- get_legend(ordered_cm_plots[[1]])
+
+# Remove the legend from every panel
+ordered_cm_plots_no_legend <- map(ordered_cm_plots, function(p) {
+  p + scale_fill_gradient(
+    low = "white", high = "#2C7BB6",
+    limits = c(0, 1),
+    guide = "none"
+  )
+})
+
+# Build patchwork of panels (no legend on any)
+cm_panels <- wrap_plots(ordered_cm_plots_no_legend, ncol = 2) +
+  plot_annotation(
+    title = "Perry confusion matrices across taxonomic levels",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  )
+
+# Combine panels + legend in a horizontal layout
+fig3 <- plot_grid(cm_panels, shared_legend_cm,
+                  ncol = 2,
+                  rel_widths = c(1, 0.08))
+
+print(fig3)
+ggsave(file.path(fig_dir, "fig3_confusion_matrices.png"),
+       fig3, width = 16, height = 15, dpi = 300)
+# Use the three_way table from your existing rhodic chunk
+fig4_data <- three_way %>%
+  pivot_longer(cols = c(ncss_rhodic_med, perry_rhodic_med, perry_typic_med),
+               names_to = "group", values_to = "value") %>%
+  mutate(
+    group = recode(group,
+                   ncss_rhodic_med = "NCSS Rhodic (training)",
+                   perry_rhodic_med = "Perry Rhodic (truth)",
+                   perry_typic_med = "Perry Typic"),
+    group = factor(group, levels = c("NCSS Rhodic (training)",
+                                      "Perry Rhodic (truth)",
+                                      "Perry Typic"))
+  ) %>%
+  filter(!is.na(value))
+
+# Pretty feature labels
+feat_labels <- c(
+  R_w = "Red (RGB)", G_w = "Green (RGB)", B_w = "Blue (RGB)",
+  clay_w = "Clay %", sand_w = "Sand %", silt_w = "Silt %",
+  depth_to_Bt_cm = "Depth to Bt (cm)",
+  bt_thickness_cm = "Bt thickness (cm)",
+  max_clay_ratio_0_150 = "Max clay ratio (0-150 cm)",
+  max_clay_delta_0_150 = "Max clay delta (0-150 cm)"
+)
+
+fig4_data <- fig4_data %>%
+  mutate(feature = factor(feature, levels = names(feat_labels),
+                          labels = feat_labels[names(feat_labels)]))
+
+fig4 <- ggplot(fig4_data, aes(x = group, y = value, fill = group)) +
+  geom_col() +
+  facet_wrap(~ feature, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = c("NCSS Rhodic (training)" = "#D7191C",
+                                "Perry Rhodic (truth)" = "#FDAE61",
+                                "Perry Typic" = "#ABD9E9"),
+                    name = NULL) +
+  labs(x = NULL, y = "Median value",
+       title = "Perry Rhodics are morphologically more extreme than NCSS Rhodics",
+       subtitle = "Higher clay translocation, thinner Bt — out of NCSS training distribution") +
+  thesis_theme +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text = element_text(size = 10))
+
+print(fig4)
+ggsave(file.path(fig_dir, "fig4_rhodic_features.png"),
+       fig4, width = 12, height = 7, dpi = 300)
+
+# Two-panel: accuracy on top, bal_accuracy on bottom
+fig5_data <- combined %>%
+  filter(!is_min5) %>%
+  group_by(outcome, dataset) %>%
+  slice_max(kap, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(n_classes_lookup, by = "outcome") %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    dataset = factor(dataset, levels = c("NCSS (internal test)", "Perry (external)"))
+  )
+
+n_class_labels5 <- fig5_data %>%
+  group_by(outcome) %>%
+  summarise(n_classes_max = first(n_classes_max), .groups = "drop")
+
+# Long format for two facets
+fig5_long <- fig5_data %>%
+  select(outcome, dataset, accuracy, bal_accuracy) %>%
+  pivot_longer(cols = c(accuracy, bal_accuracy),
+               names_to = "metric", values_to = "value") %>%
+  mutate(metric = recode(metric,
+                         accuracy = "Accuracy",
+                         bal_accuracy = "Balanced Accuracy"),
+         metric = factor(metric, levels = c("Accuracy", "Balanced Accuracy")))
+
+fig5 <- ggplot(fig5_long, aes(x = outcome, y = value, fill = dataset)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = ifelse(is.na(value), "", round(value, 2))),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3) +
+  geom_text(data = n_class_labels5 %>%
+              tidyr::crossing(metric = factor(c("Accuracy", "Balanced Accuracy"),
+                                              levels = c("Accuracy", "Balanced Accuracy"))),
+            aes(x = outcome, y = 1.02, label = paste0("k=", n_classes_max)),
+            inherit.aes = FALSE, size = 3.2, fontface = "italic", color = "grey30") +
+  facet_wrap(~ metric, ncol = 1) +
+  scale_fill_manual(values = c("NCSS (internal test)" = "#2C7BB6",
+                                "Perry (external)" = "#D7191C"),
+                    name = NULL) +
+  scale_y_continuous(limits = c(0, 1.08), expand = c(0, 0)) +
+  labs(x = NULL, y = NULL,
+       title = "Accuracy vs. balanced accuracy across taxonomic levels",
+       subtitle = "Plain accuracy hides class-imbalance failures (k = n classes)") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(fig5)
+ggsave(file.path(fig_dir, "fig5_accuracy_balaccuracy.png"),
+       fig5, width = 9, height = 8, dpi = 300)
+
+
+
+library(tidyverse)
+library(here)
+library(ggplot2)
+
+fig_dir <- here("outputs", "figures_05_02")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+thesis_theme <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# Load NCSS bootstrapped summary (10 reps)
+ncss_summary <- read.csv(here("outputs", "reports_05_02",
+                               "test_metrics_summary_clean.csv")) %>%
+  mutate(
+    dataset = "NCSS (internal test)",
+    kap_value = kap_median,
+    kap_lo = kap_lo_95,
+    kap_hi = kap_hi_95
+  ) %>%
+  select(outcome, engine, space, dataset, kap_value, kap_lo, kap_hi)
+
+# Load Perry results (point estimates from canonical bundles)
+perry_results <- read.csv(here("outputs", "reports_05_02",
+                                "perry_external_validation.csv")) %>%
+  filter(!is_min5 | outcome != "taxonname_clean") %>%   # use min_n=15 series for parity with NCSS bootstrap
+  mutate(
+    dataset = "Perry (external)",
+    kap_value = kap,
+    kap_lo = NA_real_,
+    kap_hi = NA_real_
+  ) %>%
+  select(outcome, engine, space, dataset, kap_value, kap_lo, kap_hi)
+
+# Combine
+fig_data <- bind_rows(ncss_summary, perry_results) %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    dataset = factor(dataset, levels = c("NCSS (internal test)", "Perry (external)")),
+    variant = paste(engine, space, sep = " / "),
+    variant = recode(variant,
+                     "rf / plain"     = "RF (plain)",
+                     "xgb / plain"    = "XGB (plain)",
+                     "rf / umap_hdb"  = "RF (UMAP+HDB)",
+                     "xgb / umap_hdb" = "XGB (UMAP+HDB)"),
+    variant = factor(variant, levels = c("RF (plain)", "XGB (plain)",
+                                          "RF (UMAP+HDB)", "XGB (UMAP+HDB)"))
+  )
+
+# Build the figure: dodge by variant within each outcome, color by dataset
+fig_perry_variants <- ggplot(fig_data,
+                              aes(x = outcome, y = kap_value,
+                                  color = variant, shape = dataset)) +
+  # Error bars only show for NCSS (Perry has NA bounds)
+  geom_errorbar(aes(ymin = kap_lo, ymax = kap_hi),
+                position = position_dodge(width = 0.7),
+                width = 0.25, na.rm = TRUE, linewidth = 0.4) +
+  geom_point(size = 3, position = position_dodge(width = 0.7)) +
+  scale_color_manual(values = c("RF (plain)"     = "#2C7BB6",
+                                 "XGB (plain)"    = "#1A9641",
+                                 "RF (UMAP+HDB)"  = "#FDAE61",
+                                 "XGB (UMAP+HDB)" = "#D7191C"),
+                     name = "Model variant") +
+  scale_shape_manual(values = c("NCSS (internal test)" = 16,
+                                 "Perry (external)" = 17),
+                     name = NULL) +
+  scale_y_continuous(limits = c(-0.05, 1.05), expand = c(0, 0)) +
+  labs(x = NULL, y = "Cohen's Kappa",
+       title = "Model variant comparison: NCSS internal vs. Perry external",
+       subtitle = "NCSS error bars: 95% range across 10 train/test replicates;\n Perry: canonical-bundle point estimate") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "right",
+        legend.box = "vertical")
+
+print(fig_perry_variants)
+ggsave(file.path(fig_dir, "fig_perry_variants_comparison.png"),
+       fig_perry_variants, width = 11, height = 6, dpi = 300)
+```
+```{r}
+#perry performance:
+
+fig_dir <- here("outputs", "figures_05_02")
+
+thesis_theme <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# Load Perry results
+perry_results <- read.csv(here("outputs", "reports_05_02",
+                                "perry_external_validation.csv")) %>%
+  filter(is_min5 | outcome != "taxonname_clean")   # min_n=5 for series
+
+perry_for_plot <- perry_results %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    variant = paste(engine, space, sep = " / "),
+    variant = recode(variant,
+                     "rf / plain"     = "RF (plain)",
+                     "xgb / plain"    = "XGB (plain)",
+                     "rf / umap_hdb"  = "RF (UMAP+HDB)",
+                     "xgb / umap_hdb" = "XGB (UMAP+HDB)"),
+    variant = factor(variant, levels = c("RF (plain)", "XGB (plain)",
+                                          "RF (UMAP+HDB)", "XGB (UMAP+HDB)"))
+  )
+
+fig_perry_dots <- ggplot(perry_for_plot,
+                         aes(x = outcome, y = kap,
+                             color = variant, fill = variant)) +
+  geom_point(position = position_dodge(width = 0.7),
+             size = 4, shape = 21, color = "black", stroke = 1) +
+  scale_fill_manual(values = c("RF (plain)"     = "#2C7BB6",
+                                "XGB (plain)"    = "#1A9641",
+                                "RF (UMAP+HDB)"  = "#FDAE61",
+                                "XGB (UMAP+HDB)" = "#D7191C"),
+                    name = NULL) +
+  scale_color_manual(values = c("RF (plain)"     = "#2C7BB6",
+                                 "XGB (plain)"    = "#1A9641",
+                                 "RF (UMAP+HDB)"  = "#FDAE61",
+                                 "XGB (UMAP+HDB)" = "#D7191C"),
+                     guide = "none") +
+  scale_y_continuous(limits = c(-0.05, 1.05), expand = c(0, 0)) +
+  labs(x = NULL, y = "Cohen's Kappa",
+       title = "Perry external performance by model variant at each taxonomic level",
+       subtitle = "Plain features dominate at fine taxonomic levels; UMAP+HDB only wins at order") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "top")
+
+print(fig_perry_dots)
+ggsave(file.path(fig_dir, "fig_perry_variability_dots.png"),
+       fig_perry_dots, width = 12, height = 6, dpi = 300)
+```
+
+```{r predictor table}
+# ============================================================
+# PREDICTOR INVENTORY TABLE - export to CSV
+# ============================================================
+
+predictor_table <- tibble::tribble(
+  ~Category, ~Predictor, ~Description,
+
+  # Location
+  "Location", "POINT_X", "Easting/longitude coordinate",
+  "Location", "POINT_Y", "Northing/latitude coordinate",
+
+  # Texture
+  "Texture (0-150 cm, depth-weighted)", "sand_w", "Sand fraction (%)",
+  "Texture (0-150 cm, depth-weighted)", "silt_w", "Silt fraction (%)",
+  "Texture (0-150 cm, depth-weighted)", "clay_w", "Clay fraction (%)",
+
+  # Color
+  "Color (Munsell to sRGB, depth-weighted)", "R_w", "Red channel (0-1)",
+  "Color (Munsell to sRGB, depth-weighted)", "G_w", "Green channel (0-1)",
+  "Color (Munsell to sRGB, depth-weighted)", "B_w", "Blue channel (0-1)",
+
+  # Chemistry (NCSS only)
+  "Chemistry (NCSS only; imputed in Perry)", "cec7_w", "Cation exchange capacity at pH 7 (cmol/kg, weighted)",
+  "Chemistry (NCSS only; imputed in Perry)", "pct_hz_with_cec7", "Proportion of horizons with measured CEC7",
+  "Chemistry (NCSS only; imputed in Perry)", "min_cec_per_kg_clay_0_150", "Minimum CEC per kg clay in 0-150 cm zone",
+  "Chemistry (NCSS only; imputed in Perry)", "median_cec_per_kg_clay_bt_zone", "Median CEC per kg clay within Bt zone",
+
+  # Horizon suffix flags
+  "Horizon suffix flags", "any_t_suffix", "Any horizon with 't' (illuvial clay)",
+  "Horizon suffix flags", "any_g_suffix", "Any horizon with 'g' (gleyed)",
+  "Horizon suffix flags", "any_x_suffix", "Any horizon with 'x' (fragipan)",
+  "Horizon suffix flags", "any_k_suffix", "Any horizon with 'k' (carbonate accumulation)",
+
+  # Horizon designation proportions
+  "Horizon designation proportions", "prop_hzbase_A", "Proportion of profile in A horizon",
+  "Horizon designation proportions", "prop_hzbase_Ap", "Proportion in Ap horizon (plowed)",
+  "Horizon designation proportions", "prop_hzbase_AB", "Proportion in AB transition",
+  "Horizon designation proportions", "prop_hzbase_AE", "Proportion in AE transition",
+  "Horizon designation proportions", "prop_hzbase_E", "Proportion in E horizon",
+  "Horizon designation proportions", "prop_hzbase_EA", "Proportion in EA transition",
+  "Horizon designation proportions", "prop_hzbase_EB", "Proportion in EB transition",
+  "Horizon designation proportions", "prop_hzbase_B", "Proportion in B horizon",
+  "Horizon designation proportions", "prop_hzbase_BA", "Proportion in BA transition",
+  "Horizon designation proportions", "prop_hzbase_BC", "Proportion in BC transition",
+  "Horizon designation proportions", "prop_hzbase_BE", "Proportion in BE transition",
+  "Horizon designation proportions", "prop_hzbase_Bw", "Proportion in Bw horizon",
+  "Horizon designation proportions", "prop_hzbase_Bt", "Proportion in Bt horizon (illuvial clay)",
+  "Horizon designation proportions", "prop_hzbase_Btv", "Proportion in Btv (with plinthite)",
+  "Horizon designation proportions", "prop_hzbase_Btx", "Proportion in Btx (with fragipan)",
+  "Horizon designation proportions", "prop_hzbase_Btc", "Proportion in Btc (with concretions)",
+  "Horizon designation proportions", "prop_hzbase_Btg", "Proportion in Btg (gleyed Bt)",
+  "Horizon designation proportions", "prop_hzbase_Btgv", "Proportion in Btgv",
+  "Horizon designation proportions", "prop_hzbase_Btgx", "Proportion in Btgx",
+  "Horizon designation proportions", "prop_hzbase_Btvc", "Proportion in Btvc",
+  "Horizon designation proportions", "prop_hzbase_Btvx", "Proportion in Btvx",
+  "Horizon designation proportions", "prop_hzbase_Btcv", "Proportion in Btcv",
+  "Horizon designation proportions", "prop_hzbase_Btcn", "Proportion in Btcn",
+  "Horizon designation proportions", "prop_hzbase_Btcb", "Proportion in Btcb (buried)",
+  "Horizon designation proportions", "prop_hzbase_Btb", "Proportion in Btb (buried Bt)",
+  "Horizon designation proportions", "prop_hzbase_Btgb", "Proportion in Btgb (buried gleyed)",
+  "Horizon designation proportions", "prop_hzbase_Btss", "Proportion in Btss (slickensides)",
+  "Horizon designation proportions", "prop_hzbase_Bg", "Proportion in Bg horizon",
+  "Horizon designation proportions", "prop_hzbase_Bx", "Proportion in Bx horizon",
+  "Horizon designation proportions", "prop_hzbase_Bh", "Proportion in Bh (illuvial humus)",
+  "Horizon designation proportions", "prop_hzbase_Bc", "Proportion in Bc horizon",
+  "Horizon designation proportions", "prop_hzbase_Bwc", "Proportion in Bwc horizon",
+  "Horizon designation proportions", "prop_hzbase_Bwb", "Proportion in Bwb (buried)",
+  "Horizon designation proportions", "prop_hzbase_Eg", "Proportion in Eg (gleyed E)",
+  "Horizon designation proportions", "prop_hzbase_Ex", "Proportion in Ex",
+  "Horizon designation proportions", "prop_hzbase_Eb", "Proportion in Eb (buried)",
+  "Horizon designation proportions", "prop_hzbase_Ec", "Proportion in Ec",
+  "Horizon designation proportions", "prop_hzbase_Ag", "Proportion in Ag (gleyed A)",
+  "Horizon designation proportions", "prop_hzbase_Ab", "Proportion in Ab (buried A)",
+  "Horizon designation proportions", "prop_hzbase_Ac", "Proportion in Ac",
+  "Horizon designation proportions", "prop_hzbase_Acb", "Proportion in Acb",
+  "Horizon designation proportions", "prop_hzbase_Apc", "Proportion in Apc",
+  "Horizon designation proportions", "prop_hzbase_C", "Proportion in C horizon",
+  "Horizon designation proportions", "prop_hzbase_Cc", "Proportion in Cc",
+  "Horizon designation proportions", "prop_hzbase_Cg", "Proportion in Cg (gleyed C)",
+  "Horizon designation proportions", "prop_hzbase_Cr", "Proportion in Cr (weathered bedrock)",
+  "Horizon designation proportions", "prop_hzbase_R", "Proportion in R (bedrock)",
+  "Horizon designation proportions", "prop_hzbase_Oa", "Proportion in Oa (sapric organic)",
+  "Horizon designation proportions", "prop_hzbase_Oe", "Proportion in Oe (hemic organic)",
+  "Horizon designation proportions", "prop_hzbase_Unknown", "Proportion of unparseable horizons",
+
+  # Bt horizon depth/thickness
+  "Bt horizon depth and thickness", "depth_to_Bt_cm", "Depth to top of any Bt (cm)",
+  "Bt horizon depth and thickness", "bt_top_cm", "Depth to top of Bt-like horizon (cm)",
+  "Bt horizon depth and thickness", "bt_thickness_cm", "Total Bt thickness (cm)",
+  "Bt horizon depth and thickness", "bt_thk_0_150_cm", "Bt thickness within 0-150 cm zone",
+  "Bt horizon depth and thickness", "has_Bt_0_150", "Bt present within 0-150 cm (binary)",
+  "Bt horizon depth and thickness", "has_bt_like", "Any Bt-like horizon present (binary)",
+  "Bt horizon depth and thickness", "has_bt_below_mantle", "Bt occurs below sandy mantle (binary)",
+
+  # Argillic horizon
+  "Argillic horizon", "depth_to_argillic_cm", "Depth to top of argillic horizon (cm)",
+  "Argillic horizon", "argillic_top_cm", "Argillic top depth (cm)",
+  "Argillic horizon", "argillic_thickness_cm", "Argillic thickness (cm)",
+  "Argillic horizon", "argillic_thk_0_150_cm", "Argillic thickness within 0-150 cm",
+  "Argillic horizon", "argillic_contiguous_max_cm", "Maximum contiguous argillic thickness (cm)",
+  "Argillic horizon", "has_argillic_0_150", "Argillic present in 0-150 cm (binary)",
+
+  # E horizon
+  "E horizon", "depth_to_E_cm", "Depth to top of E horizon (cm)",
+  "E horizon", "has_E_0_150", "E horizon present in 0-150 cm (binary)",
+
+  # Gley features
+  "Gley features", "depth_to_gley_cm", "Depth to first gleyed horizon (cm)",
+  "Gley features", "has_gley_0_150", "Gley present in 0-150 cm (binary)",
+
+  # Sandy mantle / surface texture
+  "Sandy mantle and surface texture", "sandy_mantle_cm", "Thickness of surface sandy mantle (cm)",
+  "Sandy mantle and surface texture", "depth_to_first_nonsandy_cm", "Depth to first non-sandy horizon (cm)",
+  "Sandy mantle and surface texture", "sandy_layers_n_surface", "Number of contiguous sandy surface layers",
+  "Sandy mantle and surface texture", "pct_sandy_0_150", "Percent of 0-150 cm with sandy texture",
+  "Sandy mantle and surface texture", "mean_sand_0_150", "Mean sand content 0-150 cm (%)",
+  "Sandy mantle and surface texture", "mean_clay_0_150", "Mean clay content 0-150 cm (%)",
+  "Sandy mantle and surface texture", "delta_clay_at_mantle_break", "Clay change at sandy/Bt boundary (%)",
+  "Sandy mantle and surface texture", "delta_sand_at_mantle_break", "Sand change at sandy/Bt boundary (%)",
+  "Sandy mantle and surface texture", "abrupt_sand_to_bt_transition", "Abrupt sand-to-Bt transition (binary)",
+
+  # Clay translocation indices
+  "Clay translocation indices", "max_clay_ratio_0_150", "Maximum clay ratio in 0-150 cm",
+  "Clay translocation indices", "max_clay_delta_0_150", "Maximum absolute clay increase (%)",
+  "Clay translocation indices", "depth_to_first_clay_jump", "Depth where clay first jumps (cm)",
+  "Clay translocation indices", "has_major_clay_drop_within_150", "Major clay decrease within 150 cm (binary)",
+  "Clay translocation indices", "depth_to_20pct_clay_decrease", "Depth to 20% clay drop (cm)",
+  "Clay translocation indices", "clay_persistence_index_0_150", "Clay persistence index in 0-150 cm",
+
+  # Plinthite features
+  "Plinthite features", "plinthite_flag", "Any plinthite present (binary)",
+  "Plinthite features", "plinthite_within_150cm_flag", "Plinthite within 150 cm (binary)",
+  "Plinthite features", "top_depth_plinthite", "Depth to top of plinthite (cm)",
+  "Plinthite features", "plinthite_thickness_cm", "Total plinthite thickness (cm)",
+  "Plinthite features", "pct_plinthite_by_hz", "Percent of horizons containing plinthite",
+  "Plinthite features", "pct_plinthite_by_thickness", "Percent of profile thickness with plinthite",
+  "Plinthite features", "plinthite_overlap_0_150_cm", "Plinthite overlap with 0-150 cm zone"
+)
+
+cat("Total predictors in table:", nrow(predictor_table), "\n")
+
+write.csv(predictor_table,
+          "../outputs/reports_05_02/predictor_inventory.csv",
+          row.names = FALSE)
+
+cat("Saved to: ../outputs/reports_05_02/predictor_inventory.csv\n")
+```
+
+```{r}
+
+
+fig_dir <- here("outputs", "figures_05_02")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+thesis_theme <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# ============================================================
+# LOAD NCSS BOOTSTRAPPED SUMMARY (from repeated-splits framework)
+# ============================================================
+ncss_for_plot <- read.csv(here("outputs", "reports_05_02",
+                                "test_metrics_summary_clean.csv")) %>%
+  mutate(dataset = "NCSS (internal test)") %>%
+  select(outcome, engine, space, dataset,
+         kap_median, kap_lo_95, kap_hi_95)
+
+# ============================================================
+# LOAD PERRY POINT ESTIMATES (from canonical deployment)
+# ============================================================
+perry_for_plot <- read.csv(here("outputs", "reports_05_02",
+                                 "perry_external_validation.csv")) %>%
+  filter(!is_min5 | outcome != "taxonname_clean") %>%  # use min_n=15 series for parity
+  mutate(
+    dataset = "Perry (external)",
+    kap_median = kap,
+    kap_lo_95 = NA_real_,
+    kap_hi_95 = NA_real_
+  ) %>%
+  select(outcome, engine, space, dataset,
+         kap_median, kap_lo_95, kap_hi_95)
+
+# ============================================================
+# n_classes_lookup — derive from bundle inventory
+# ============================================================
+n_classes_lookup <- read.csv(here("outputs", "reports_05_02",
+                                   "perry_bundle_inventory.csv")) %>%
+  group_by(outcome) %>%
+  summarise(n_classes_max = max(n_classes, na.rm = TRUE), .groups = "drop")
+
+# ============================================================
+# COMBINE AND PICK BEST VARIANT PER (outcome × dataset)
+# ============================================================
+fig1_data <- bind_rows(ncss_for_plot, perry_for_plot) %>%
+  group_by(outcome, dataset) %>%
+  slice_max(kap_median, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(n_classes_lookup, by = "outcome") %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    dataset = factor(dataset, levels = c("NCSS (internal test)", "Perry (external)"))
+  )
+
+n_class_labels <- fig1_data %>%
+  group_by(outcome) %>%
+  summarise(n_classes_max = first(n_classes_max), .groups = "drop")
+
+# ============================================================
+# BUILD THE FIGURE
+# ============================================================
+fig1 <- ggplot(fig1_data, aes(x = outcome, y = kap_median, fill = dataset)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = kap_lo_95, ymax = kap_hi_95),
+                position = position_dodge(width = 0.8),
+                width = 0.25, na.rm = TRUE) +
+  geom_text(aes(label = sprintf("%.2f", kap_median)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3.2) +
+  geom_text(data = n_class_labels,
+            aes(x = outcome, y = 1.05, label = paste0("k=", n_classes_max)),
+            inherit.aes = FALSE, size = 3.4, fontface = "italic", color = "grey30") +
+  scale_fill_manual(values = c("NCSS (internal test)" = "#2C7BB6",
+                                "Perry (external)" = "#D7191C"),
+                    name = NULL) +
+  scale_y_continuous(limits = c(-0.05, 1.10), expand = c(0, 0)) +
+  labs(x = NULL, y = "Cohen's Kappa (median ± 95% range, NCSS only)",
+       title = "Model performance degrades from coarse to fine taxonomic levels",
+       subtitle = "NCSS error bars: 95% range across 10 replicates; Perry: canonical-bundle point estimate") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(fig1)
+ggsave(file.path(fig_dir, "fig1_kappa_by_level_with_ci.png"),
+       fig1, width = 9, height = 5.5, dpi = 300)
+```
+
+```{r}
+
+fig_dir <- here("outputs", "figures_05_02")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+thesis_theme <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# ============================================================
+# IDENTIFY BEST VARIANT PER OUTCOME (by Perry kap)
+# ============================================================
+# Series gets min_n=5 (the deployment-realistic version)
+best_perry_per_outcome <- read.csv(
+  here("outputs", "reports_05_02", "perry_external_validation.csv")
+) %>%
+  filter(is_min5 | outcome != "taxonname_clean") %>%
+  group_by(outcome) %>%
+  slice_max(kap, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+cat("Best Perry variant per outcome:\n")
+print(best_perry_per_outcome %>% select(outcome, engine, space, is_min5, bundle, kap))
+
+# ============================================================
+# PULL PERRY PREDICTIONS WITH PROBABILITIES
+# perry_preds is a list of tibbles, indexed by bundle name —
+# already produced in your deploy chunk and lives in memory.
+# ============================================================
+compute_perry_rank <- function(pred_df, truth_df, bundle_name, outcome) {
+  pred_df <- pred_df %>% mutate(peiid = as.character(peiid))
+  truth_df <- truth_df %>% mutate(peiid = as.character(peiid))
+  
+  # Join with truth, keep only pedons with unambiguous truth
+  joined <- pred_df %>%
+    left_join(truth_df %>% select(peiid, truth, n_truth_unique), by = "peiid") %>%
+    filter(!is.na(truth), n_truth_unique == 1)
+  
+  if (nrow(joined) == 0) return(NULL)
+  
+  prob_cols <- names(joined)[
+    str_detect(names(joined), "^\\.pred_") & names(joined) != ".pred_class"
+  ]
+  class_names <- str_remove(prob_cols, "^\\.pred_")
+  
+  map_dfr(seq_len(nrow(joined)), function(i) {
+    p <- as.numeric(joined[i, prob_cols])
+    names(p) <- class_names
+    sorted <- sort(p, decreasing = TRUE)
+    
+    truth <- joined$truth[i]
+    rank_truth <- which(names(sorted) == truth)
+    if (length(rank_truth) == 0) rank_truth <- NA_integer_
+    
+    tibble(
+      peiid = joined$peiid[i],
+      outcome = outcome,
+      bundle_name = bundle_name,
+      truth = truth,
+      rank1_class = names(sorted)[1],
+      rank2_class = if (length(sorted) >= 2) names(sorted)[2] else NA_character_,
+      rank3_class = if (length(sorted) >= 3) names(sorted)[3] else NA_character_,
+      rank_of_truth = rank_truth,
+      pred_top1 = names(sorted)[1]
+    )
+  })
+}
+
+# Apply across the chosen best-variant bundles
+perry_ranks_full <- map_dfr(seq_len(nrow(best_perry_per_outcome)), function(i) {
+  bn <- best_perry_per_outcome$bundle[i]
+  oc <- best_perry_per_outcome$outcome[i]
+  truth_key <- oc  # all outcomes use their own name as truth key
+  
+  pred_df <- perry_preds[[bn]]
+  truth_df <- perry_truth[[truth_key]]
+  
+  if (is.null(pred_df) || is.null(truth_df)) {
+    cat("Missing data for", bn, "\n")
+    return(NULL)
+  }
+  
+  compute_perry_rank(pred_df, truth_df, bn, oc)
+})
+
+cat("\nTotal Perry ranked predictions:", nrow(perry_ranks_full), "\n")
+write.csv(perry_ranks_full,
+          here("outputs", "reports_05_02", "perry_test_ranks.csv"),
+          row.names = FALSE)
+
+# ============================================================
+# PLOT
+# ============================================================
+plot_perry_rank <- function(rank_df, outcome_label) {
+  rank_df <- rank_df %>%
+    filter(!is.na(rank_of_truth)) %>%
+    mutate(
+      rank_category = case_when(
+        rank_of_truth == 1 ~ "Rank 1\n(correct)",
+        rank_of_truth == 2 ~ "Rank 2\n(close miss)",
+        rank_of_truth == 3 ~ "Rank 3",
+        rank_of_truth >= 4 & rank_of_truth <= 5 ~ "Rank 4-5",
+        rank_of_truth >= 6 ~ "Rank 6+\n(off)"
+      ),
+      rank_category = factor(rank_category,
+                             levels = c("Rank 1\n(correct)",
+                                        "Rank 2\n(close miss)",
+                                        "Rank 3",
+                                        "Rank 4-5",
+                                        "Rank 6+\n(off)"))
+    )
+  
+  # Order classes by total count (most common at top)
+  truth_order <- rank_df %>% count(truth) %>% arrange(n) %>% pull(truth)
+  
+  # Count and proportion per (truth × rank_category)
+  rank_summary <- rank_df %>%
+    count(truth, rank_category) %>%
+    group_by(truth) %>%
+    mutate(prop = n / sum(n)) %>%
+    ungroup() %>%
+    mutate(truth = factor(truth, levels = truth_order))
+  
+  # "What was predicted instead" for non-rank-1 cells
+  predicted_instead <- rank_df %>%
+    filter(rank_of_truth >= 2) %>%
+    mutate(
+      rank_category = case_when(
+        rank_of_truth == 2 ~ "Rank 2\n(close miss)",
+        rank_of_truth == 3 ~ "Rank 3",
+        rank_of_truth >= 4 & rank_of_truth <= 5 ~ "Rank 4-5",
+        rank_of_truth >= 6 ~ "Rank 6+\n(off)"
+      ),
+      rank_category = factor(rank_category,
+                             levels = c("Rank 1\n(correct)",
+                                        "Rank 2\n(close miss)",
+                                        "Rank 3",
+                                        "Rank 4-5",
+                                        "Rank 6+\n(off)"))
+    ) %>%
+    count(truth, rank_category, pred_top1, sort = TRUE) %>%
+    group_by(truth, rank_category) %>%
+    slice_max(n, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    rename(top_pred_label = pred_top1)
+  
+  rank_summary <- rank_summary %>%
+    left_join(predicted_instead %>% select(truth, rank_category, top_pred_label),
+              by = c("truth", "rank_category"))
+  
+  rank_summary <- rank_summary %>%
+    mutate(
+      cell_label = case_when(
+        n == 0 ~ "",
+        rank_category == "Rank 1\n(correct)" ~ as.character(n),
+        !is.na(top_pred_label) ~ paste0(n, "\n→ ", top_pred_label),
+        TRUE ~ as.character(n)
+      )
+    )
+  
+  ggplot(rank_summary, aes(x = rank_category, y = truth, fill = prop)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = cell_label), size = 4, lineheight = 0.85) +
+    scale_fill_gradient2(low = "#D55E00", mid = "#E69F00", high = "#009E73",
+                         midpoint = 0.3,
+                         limits = c(0, 1),
+                         name = "Row prop") +
+    labs(x = "Rank of truth in model's predictions",
+         y = "True class",
+         title = outcome_label) +
+    thesis_theme +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5, size = 8),
+          axis.text.y = element_text(size = 8),
+          panel.grid = element_blank(),
+          legend.position = "right")
+}
+
+# Build per-outcome plots
+perry_rank_plots <- list()
+outcomes_with_data <- perry_ranks_full %>% distinct(outcome) %>% pull(outcome)
+
+for (oc in outcomes_with_data) {
+  rd <- perry_ranks_full %>% filter(outcome == oc)
+  if (nrow(rd) == 0) next
+  perry_rank_plots[[oc]] <- plot_perry_rank(rd, tax_labels[oc])
+}
+
+# Save individual plots
+for (oc in names(perry_rank_plots)) {
+  print(perry_rank_plots[[oc]])
+  ggsave(file.path(fig_dir, paste0("fig_perry_rank_", oc, ".png")),
+         perry_rank_plots[[oc]],
+         width = 11, height = 8, dpi = 300)
+}
+
+# Patchwork multipanel
+# Make sure list keys exist and follow tax_order
+ordered_plots <- perry_rank_plots[tax_order]
+ordered_plots <- ordered_plots[!sapply(ordered_plots, is.null)]
+
+# Remove the legend from individual plots; one shared legend on the side
+ordered_plots <- map(ordered_plots, function(p) {
+  p + theme(legend.position = "none")
+})
+
+fig_perry_ranks <- wrap_plots(ordered_plots, ncol = 2, guides = "collect") +
+  plot_annotation(
+    title = "Rank of true class in Perry predictions (best variant per outcome)",
+    subtitle = "Cell color = row-proportion; cell text = count + (most common predicted instead for misses)",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"))
+  ) &
+  theme(legend.position = "right")
+
+# But this won't actually share the legend if each plot uses geom_tile with
+# scale_fill_gradient2 — patchwork's `guides = "collect"` needs identical scales.
+# Best approach: remove individual legends and add ONE shared legend separately.
+
+print(fig_perry_ranks)
+ggsave(file.path(fig_dir, "fig_perry_ranks_combined.png"),
+       fig_perry_ranks, width = 16, height = 16, dpi = 300)
+```
+```{r}
+library(tidyverse)
+library(here)
+library(patchwork)
+
+fig_dir <- here("outputs", "figures_05_02")
+thesis_theme <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+ncss_data <- read.csv(here("outputs", "reports_05_02",
+                            "test_metrics_summary_clean.csv")) %>%
+  mutate(dataset = "NCSS (internal test)")
+
+# NCSS has reps so we have median + 95% range. For F1 and top-k we use median.
+# Compute F1 and top-k summary the same way as kappa
+ncss_reps_long <- read.csv(here("outputs", "reports_05_02",
+                                 "test_metrics_all_reps_ncss.csv"))
+
+ncss_summary_f1_topk <- ncss_reps_long %>%
+  group_by(outcome, engine, space) %>%
+  summarise(
+    f1_median  = median(f_meas_macro, na.rm = TRUE),
+    f1_lo_95   = quantile(f_meas_macro, 0.025, na.rm = TRUE),
+    f1_hi_95   = quantile(f_meas_macro, 0.975, na.rm = TRUE),
+    topk_median = median(top_k, na.rm = TRUE),
+    topk_lo_95  = quantile(top_k, 0.025, na.rm = TRUE),
+    topk_hi_95  = quantile(top_k, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ncss_for_plot <- ncss_summary_f1_topk %>%
+  mutate(dataset = "NCSS (internal test)")
+
+perry_for_plot <- read.csv(here("outputs", "reports_05_02",
+                                 "perry_external_validation.csv")) %>%
+  filter(is_min5 | outcome != "taxonname_clean") %>%   # min_n=5 for series
+  mutate(
+    dataset = "Perry (external)",
+    f1_median = f_meas_macro,
+    f1_lo_95 = NA_real_,
+    f1_hi_95 = NA_real_,
+    topk_median = top_k,
+    topk_lo_95 = NA_real_,
+    topk_hi_95 = NA_real_
+  ) %>%
+  select(outcome, engine, space, dataset,
+         f1_median, f1_lo_95, f1_hi_95,
+         topk_median, topk_lo_95, topk_hi_95)
+
+# Combine and pick best per (outcome × dataset) by F1 for the F1 plot
+fig_data_f1 <- bind_rows(
+  ncss_for_plot %>% select(outcome, engine, space, dataset,
+                            value = f1_median, lo = f1_lo_95, hi = f1_hi_95),
+  perry_for_plot %>% select(outcome, engine, space, dataset,
+                             value = f1_median, lo = f1_lo_95, hi = f1_hi_95)
+) %>%
+  group_by(outcome, dataset) %>%
+  slice_max(value, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    dataset = factor(dataset, levels = c("NCSS (internal test)", "Perry (external)")),
+    metric = "Macro F1"
+  )
+
+# And same for top-k
+fig_data_topk <- bind_rows(
+  ncss_for_plot %>% select(outcome, engine, space, dataset,
+                            value = topk_median, lo = topk_lo_95, hi = topk_hi_95),
+  perry_for_plot %>% select(outcome, engine, space, dataset,
+                             value = topk_median, lo = topk_lo_95, hi = topk_hi_95)
+) %>%
+  group_by(outcome, dataset) %>%
+  slice_max(value, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    dataset = factor(dataset, levels = c("NCSS (internal test)", "Perry (external)")),
+    metric = "Top-k Accuracy"
+  )
+
+# Combine into one long table for faceted plotting
+fig_data_combined <- bind_rows(fig_data_f1, fig_data_topk) %>%
+  mutate(metric = factor(metric, levels = c("Macro F1", "Top-k Accuracy")))
+
+# n_classes lookup for k labels
+n_classes_lookup <- read.csv(here("outputs", "reports_05_02",
+                                   "perry_bundle_inventory.csv")) %>%
+  group_by(outcome) %>%
+  summarise(n_classes_max = max(n_classes, na.rm = TRUE), .groups = "drop") %>%
+  mutate(outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]))
+
+n_class_labels <- fig_data_combined %>%
+  distinct(outcome, metric) %>%
+  left_join(n_classes_lookup, by = "outcome")
+
+# ============================================================
+# BUILD THE FIGURE
+# ============================================================
+fig_f1_topk <- ggplot(fig_data_combined,
+                      aes(x = outcome, y = value, fill = dataset)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                position = position_dodge(width = 0.8),
+                width = 0.25, na.rm = TRUE, linewidth = 0.4) +
+  geom_text(aes(label = sprintf("%.2f", value)),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3) +
+  geom_text(data = n_class_labels,
+            aes(x = outcome, y = 1.06, label = paste0("k=", n_classes_max)),
+            inherit.aes = FALSE, size = 3, fontface = "italic", color = "grey30") +
+  facet_wrap(~ metric, ncol = 1) +
+  scale_fill_manual(values = c("NCSS (internal test)" = "#2C7BB6",
+                                "Perry (external)" = "#D7191C"),
+                    name = NULL) +
+  scale_y_continuous(limits = c(-0.02, 1.10), expand = c(0, 0)) +
+  labs(x = NULL, y = NULL,
+       title = "Macro F1 and Top-k accuracy across taxonomic levels",
+       subtitle = "NCSS error bars: 95% range across 10 train/test replicates; Perry: canonical-bundle point estimate") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        strip.text = element_text(size = 12, face = "bold"))
+
+print(fig_f1_topk)
+ggsave(file.path(fig_dir, "fig_f1_topk.png"),
+       fig_f1_topk, width = 10, height = 9, dpi = 300)
+```
+
+```{r}
+#class comparison:
+library(tidyverse)
+library(here)
+library(patchwork)
+
+fig_dir <- here("outputs", "figures_05_02")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+thesis_theme <- theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+ncss_pack_path <- list.files(here("outputs"),
+                              pattern = "^pedon_pack_150_.*\\.csv$",
+                              full.names = TRUE)
+ncss_pack_path <- ncss_pack_path[which.max(file.mtime(ncss_pack_path))]
+ncss <- read.csv(ncss_pack_path)
+
+perry_pack_path <- list.files(here("outputs"),
+                               pattern = "^perry_pack_150_.*\\.csv$",
+                               full.names = TRUE)
+perry_pack_path <- perry_pack_path[which.max(file.mtime(perry_pack_path))]
+perry <- read.csv(perry_pack_path)
+
+# Perry truth labels live in perry_fp_clean (not perry_pack itself)
+perry_fp_path <- list.files(here("outputs"),
+                             pattern = "^perry_fp_clean_.*\\.csv$",
+                             full.names = TRUE)
+perry_fp_path <- perry_fp_path[which.max(file.mtime(perry_fp_path))]
+perry_fp <- read.csv(perry_fp_path)
+
+# Build Perry per-pedon truth labels (one row per pedon, dominant class)
+build_perry_truth <- function(perry_fp_clean, truth_col, lowercase = FALSE) {
+  if (!truth_col %in% names(perry_fp_clean)) return(tibble())
+
+  dat <- perry_fp_clean %>%
+    mutate(val = str_squish(as.character(.data[[truth_col]])),
+           val = na_if(val, ""),
+           val = na_if(val, "Fill"),
+           val = na_if(val, "fill"))
+
+  if (lowercase) dat <- dat %>% mutate(val = str_to_lower(val))
+  if (truth_col == "series_clean") dat <- dat %>% mutate(val = str_to_title(val))
+
+  dat %>%
+    group_by(Point) %>%
+    summarise(
+      truth = {
+        v <- val[!is.na(val)]
+        if (length(v) == 0) NA_character_ else
+          names(sort(table(v), decreasing = TRUE))[1]
+      },
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(truth)) %>%
+    pull(truth)
+}
+
+# ============================================================
+# COLLECT CLASS DISTRIBUTIONS PER OUTCOME PER DATASET
+# ============================================================
+get_class_dist <- function(values, outcome_name, dataset_name) {
+  values <- values[!is.na(values) & values != ""]
+  if (length(values) == 0) return(tibble())
+  tibble(
+    outcome = outcome_name,
+    dataset = dataset_name,
+    class = as.character(values)
+  ) %>%
+    count(outcome, dataset, class, name = "n_pedons") %>%
+    group_by(outcome, dataset) %>%
+    mutate(pct = 100 * n_pedons / sum(n_pedons)) %>%
+    ungroup()
+}
+
+# NCSS uses outcome columns directly
+ncss_dist <- bind_rows(
+  get_class_dist(ncss$taxorder,        "taxorder",        "NCSS"),
+  get_class_dist(ncss$taxsuborder,     "taxsuborder",     "NCSS"),
+  get_class_dist(ncss$taxgrtgroup,     "taxgrtgroup",     "NCSS"),
+  get_class_dist(ncss$taxsubgrp_mod1,  "taxsubgrp_mod1",  "NCSS"),
+  get_class_dist(ncss$taxpartsize,     "taxpartsize",     "NCSS"),
+  get_class_dist(ncss$taxonname_clean, "taxonname_clean", "NCSS")
+)
+
+# Perry truth comes from perry_fp_clean (one row per horizon, dedupe to pedon)
+perry_dist <- bind_rows(
+  get_class_dist(build_perry_truth(perry_fp, "taxorder"),
+                 "taxorder",       "Perry"),
+  get_class_dist(build_perry_truth(perry_fp, "taxsuborder"),
+                 "taxsuborder",    "Perry"),
+  get_class_dist(build_perry_truth(perry_fp, "taxgrtgroup"),
+                 "taxgrtgroup",    "Perry"),
+  get_class_dist(build_perry_truth(perry_fp, "taxsubgrp_mod1"),
+                 "taxsubgrp_mod1", "Perry"),
+  get_class_dist(build_perry_truth(perry_fp, "taxpartsize", lowercase = TRUE),
+                 "taxpartsize",    "Perry"),
+  get_class_dist(build_perry_truth(perry_fp, "series_clean"),
+                 "taxonname_clean","Perry")
+)
+
+class_dist <- bind_rows(ncss_dist, perry_dist) %>%
+  mutate(outcome = factor(outcome, levels = tax_order,
+                          labels = tax_labels[tax_order]),
+         dataset = factor(dataset, levels = c("NCSS", "Perry")))
+
+write.csv(class_dist,
+          here("outputs", "reports_05_02", "class_distributions_ncss_perry.csv"),
+          row.names = FALSE)
+
+# ============================================================
+# PLOT: ONE PANEL PER OUTCOME, SIDE-BY-SIDE BARS
+# ============================================================
+plot_class_dist <- function(data, outcome_label, max_classes = 15) {
+  d <- data
+
+  # Limit to top classes by combined count if too many (for series)
+  if (length(unique(d$class)) > max_classes) {
+    top_classes <- d %>%
+      group_by(class) %>%
+      summarise(total = sum(n_pedons), .groups = "drop") %>%
+      slice_max(total, n = max_classes) %>%
+      pull(class)
+    d <- d %>% filter(class %in% top_classes)
+  }
+
+  # Order classes by combined frequency (most common at top)
+  class_order <- d %>%
+    group_by(class) %>%
+    summarise(total = sum(n_pedons), .groups = "drop") %>%
+    arrange(total) %>%
+    pull(class)
+
+  d <- d %>% mutate(class = factor(class, levels = class_order))
+
+  ggplot(d, aes(x = class, y = pct, fill = dataset)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+    geom_text(aes(label = ifelse(pct < 1, "", sprintf("%.0f%%", pct))),
+              position = position_dodge(width = 0.8),
+              hjust = -0.15, size = 2.7) +
+    coord_flip() +
+    scale_fill_manual(values = c("NCSS"  = "#2C7BB6",
+                                  "Perry" = "#D7191C"),
+                      name = NULL) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+    labs(x = NULL, y = "Percent of pedons (%)", title = outcome_label) +
+    thesis_theme +
+    theme(axis.text.y = element_text(size = 9),
+          legend.position = "none")
+}
+
+# Different max_classes per outcome
+max_classes_per_outcome <- c(
+  Order = 7,
+  Suborder = 10,
+  `Great Group` = 12,
+  Subgroup = 12,
+  `Particle Size` = 8,
+  Series = 15
+)
+
+dist_plots <- list()
+for (oc in tax_labels) {
+  d <- class_dist %>% filter(outcome == oc)
+  if (nrow(d) == 0) next
+  dist_plots[[oc]] <- plot_class_dist(d, oc,
+                                       max_classes = max_classes_per_outcome[[oc]])
+}
+
+# Build a "legend-only" plot using one of the data subsets
+legend_plot <- ggplot(class_dist %>% filter(outcome == "Order"),
+                      aes(x = class, y = pct, fill = dataset)) +
+  geom_col() +
+  scale_fill_manual(values = c("NCSS"  = "#2C7BB6",
+                                "Perry" = "#D7191C"),
+                    name = NULL) +
+  thesis_theme +
+  theme(legend.position = "top")
+
+shared_legend <- cowplot::get_legend(legend_plot)
+
+# Combine into a multi-panel figure
+fig_class_dist <- (
+  (dist_plots[["Order"]]      + dist_plots[["Suborder"]]) /
+  (dist_plots[["Great Group"]] + dist_plots[["Subgroup"]]) /
+  (dist_plots[["Particle Size"]] + dist_plots[["Series"]])
+) +
+  plot_annotation(
+    title = "Class distributions in NCSS training pool vs Perry validation site",
+    subtitle = "Bars show percent of pedons in each class per dataset",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"),
+                  plot.subtitle = element_text(size = 11, color = "grey30"))
+  )
+
+# Add shared legend at top
+fig_class_dist_with_legend <- cowplot::plot_grid(
+  shared_legend,
+  fig_class_dist,
+  ncol = 1,
+  rel_heights = c(0.05, 1)
+)
+
+print(fig_class_dist_with_legend)
+ggsave(file.path(fig_dir, "fig_class_distributions.png"),
+       fig_class_dist_with_legend, width = 14, height = 16, dpi = 300)
+```
+
+
+

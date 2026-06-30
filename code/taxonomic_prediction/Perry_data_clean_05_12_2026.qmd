@@ -1,0 +1,368 @@
+---
+title: "Perry_data_clean_05_12_2026"
+format: html
+---
+
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(tibble)
+library(readr)
+library(aqp)
+
+# Source the SAME shared module used by NCSS_clean_pedon_pack.qmd.
+# This guarantees that the index calculators, horizon-name parser,
+# and pedon-pack assembler are byte-for-byte identical between datasets.
+source("../code/pedon_pack_functions_05_02_2026.R")
+``` 
+
+```{r load-raw}
+# -----------------------------------------------------------------------------
+# Load Perry field-pedon data
+# -----------------------------------------------------------------------------
+perry_fp <- read_csv("../data/Perry_FP_data_cleaned_updated_series_05_11_26.csv",
+                     show_col_types = FALSE)
+
+glimpse(perry_fp)
+```
+
+```{r normalize-taxonomy}
+# -----------------------------------------------------------------------------
+# Normalize taxonomy strings (mirror NCSS conventions) and parse subgroup
+# modifiers into taxsubgrp_mod1 / mod2 / mod3.
+# -----------------------------------------------------------------------------
+
+# Reuse the same parse_subgrp_mods used in the NCSS script.
+parse_subgrp_mods <- function(subgrp, gg_hint = NA_character_) {
+  x0 <- subgrp %>% as.character() %>% str_squish() %>% na_if("")
+  if (is.na(x0)) {
+    return(tibble(
+      subgrp_gg = gg_hint %||% NA_character_,
+      taxsubgrp_mod1 = NA_character_,
+      taxsubgrp_mod2 = NA_character_,
+      taxsubgrp_mod3 = NA_character_
+    ))
+  }
+  toks <- str_split(x0, "\\s+", simplify = FALSE)[[1]]
+  toks <- toks[toks != ""]
+  if (length(toks) == 0) {
+    return(tibble(
+      subgrp_gg = gg_hint %||% NA_character_,
+      taxsubgrp_mod1 = NA_character_,
+      taxsubgrp_mod2 = NA_character_,
+      taxsubgrp_mod3 = NA_character_
+    ))
+  }
+  gg   <- if (!is.na(gg_hint) && str_squish(gg_hint) != "") gg_hint else toks[length(toks)]
+  mods <- if (length(toks) >= 2) toks[1:(length(toks) - 1)] else character(0)
+  tibble(
+    subgrp_gg      = gg,
+    taxsubgrp_mod1 = mods[1] %||% NA_character_,
+    taxsubgrp_mod2 = mods[2] %||% NA_character_,
+    taxsubgrp_mod3 = mods[3] %||% NA_character_
+  )
+}
+
+perry_fp_clean <- perry_fp %>%
+  mutate(
+    Point          = as.character(Point),
+    Horizon        = as.character(Horizon),
+    To.Depth..cm.  = as.character(To.Depth..cm.),
+
+    taxclname   = na_if(str_squish(as.character(taxclname)),   ""),
+    taxorder    = na_if(str_squish(as.character(taxorder)),    ""),
+    taxsuborder = na_if(str_squish(as.character(taxsuborder)), ""),
+    taxgrtgroup = na_if(str_squish(as.character(taxgrtgroup)), ""),
+    taxsubgrp   = na_if(str_squish(as.character(taxsubgrp)),   ""),
+
+    # Match NCSS: taxpartsize is lowercase
+    taxpartsize = str_to_lower(na_if(str_squish(as.character(taxpartsize)), ""))
+  ) %>%
+  mutate(parsed = map2(taxsubgrp, taxgrtgroup, parse_subgrp_mods)) %>%
+  unnest_wider(parsed) %>%
+  mutate(taxgrtgroup = coalesce(taxgrtgroup, subgrp_gg)) %>%
+  select(-subgrp_gg)
+```
+
+```{r parse-depths}
+# -----------------------------------------------------------------------------
+# Parse horizon depth bounds.
+#
+# Perry's `To.Depth..cm.` column is a "top-bottom" string ("0-15", "15-30", ...).
+# When only top is parseable, fall back to top + H.Depth.cm. for bottom.
+# -----------------------------------------------------------------------------
+
+parse_top_bottom <- function(x) {
+  top <- as.numeric(str_extract(x, "^\\d+"))
+  bot <- as.numeric(str_extract(x, "(?<=-)\\d+"))
+  tibble(top_cm = top, bottom_cm = bot)
+}
+
+perry_with_depths <- perry_fp_clean %>%
+  bind_cols(parse_top_bottom(.$To.Depth..cm.)) %>%
+  mutate(
+    hzdept = as.numeric(top_cm),
+    hzdepb = if_else(
+      !is.na(bottom_cm),
+      as.numeric(bottom_cm),
+      as.numeric(top_cm) + as.numeric(H.Depth.cm.)
+    )
+  ) %>%
+  filter(is.finite(hzdept), is.finite(hzdepb), hzdepb > hzdept)
+```
+
+```{r parse-horizons}
+# -----------------------------------------------------------------------------
+# Parse horizon designations using the SHARED parser.
+# Produces hzname_clean, L_master, L_suffix, hz_base in the SAME label
+# space as NCSS — this is what makes prop_hzbase_* features comparable.
+# -----------------------------------------------------------------------------
+
+perry_hz_parsed <- perry_with_depths %>%
+  bind_cols(
+    parse_hznames(.$Horizon) %>%
+      select(hzname_clean, L_master, L_suffix, hz_base)
+  ) %>%
+  rename(hzname = Horizon)
+```
+
+```{r parse-color}
+# -----------------------------------------------------------------------------
+# Convert Munsell matrix color -> R, G, B in [0, 1].
+#
+# IMPORTANT: must use the same scale as NCSS (where col2rgb output / 255 was
+# stored). The NCSS path was: munsell_hex -> col2rgb / 255. We replicate that
+# exactly here, instead of using parseMunsell(return_triplets = TRUE) whose
+# output convention may differ slightly.
+# -----------------------------------------------------------------------------
+
+fix_munsell <- function(x) {
+  x %>%
+    as.character() %>%
+    str_squish() %>%
+    # split fused forms like "10YR4/3" -> "10YR 4/3"
+    str_replace("^([0-9.]+[A-Z]+)([0-9.]+/[0-9.]+)$", "\\1 \\2")
+}
+
+perry_hz_color <- perry_hz_parsed %>%
+  mutate(
+    munsell      = fix_munsell(Matrix.Color),
+    munsell      = na_if(munsell, ""),
+    munsell_hex  = aqp::parseMunsell(munsell)
+  )
+
+idx <- which(!is.na(perry_hz_color$munsell_hex) & perry_hz_color$munsell_hex != "")
+rgb_mat <- matrix(NA_real_, nrow(perry_hz_color), 3,
+                  dimnames = list(NULL, c("R", "G", "B")))
+rgb_mat[idx, ] <- t(grDevices::col2rgb(perry_hz_color$munsell_hex[idx])) / 255
+
+perry_hz_color <- perry_hz_color %>%
+  mutate(R = rgb_mat[, "R"], G = rgb_mat[, "G"], B = rgb_mat[, "B"])
+```
+
+```{r assemble-hz-table}
+# -----------------------------------------------------------------------------
+# Assemble Perry horizon-level table conforming to PEDON_PACK_HZ_SCHEMA.
+#
+# Decisions on missing or differently-named columns:
+#
+#   peiid           <- Perry "Point" (string)
+#   sandtotmeasured <- lab_sand            (assumed % by mass, 0-100)
+#   silttotmeasured <- lab_silt            (assumed % by mass, 0-100)
+#   claytotmeasured <- lab_clay            (assumed % by mass, 0-100)
+#   texcl           <- lab_texture_class
+#   cec7            <- NA_real_            (not measured for full Perry set;
+#                                           see notes below)
+#
+# CEC NOTE
+# --------
+# We have CEC for only a subset of Perry pedons, and on that subset the
+# values are below the kandic 16-cmol(+)/kg-clay threshold. Two options were
+# considered:
+#
+#   (1) Stamp Perry Bt horizons with a low cec7 to encode the kandic
+#       assumption. REJECTED — this would silently inject the kandic prior
+#       into great-group prediction (essentially hardcoding the answer for
+#       Kandiudult vs. non-Kandi great groups).
+#
+#   (2) Leave cec7 as NA. The training recipe's step_impute_median will fill
+#       with the NCSS training median at predict time. The model will treat
+#       CEC-derived features (cec7_w, min_cec_per_kg_clay_0_150, etc.) as
+#       low-information signals for these pedons. This is the most honest
+#       option and the one we use. Document the kandic assumption in the
+#       interpretation of results, not in the input data.
+#
+# We additionally surface `pct_hz_with_cec7` (a per-pedon coverage proxy)
+# from build_pedon_pack(), so the model and downstream analysis can see how
+# CEC-poor each pedon is.
+# -----------------------------------------------------------------------------
+
+perry_hz_table <- perry_hz_color %>%
+  transmute(
+    peiid           = as.character(Point),
+    hzdept          = as.numeric(hzdept),
+    hzdepb          = as.numeric(hzdepb),
+    hzname          = as.character(hzname),
+    hzname_clean    = as.character(hzname_clean),
+    hz_base         = as.character(hz_base),
+    L_master        = as.character(L_master),
+    L_suffix        = as.character(L_suffix),
+    texcl           = as.character(lab_texture_class),
+    sandtotmeasured = as.numeric(lab_sand),
+    silttotmeasured = as.numeric(lab_silt),
+    claytotmeasured = as.numeric(lab_clay),
+    cec7            = NA_real_,
+    R               = as.numeric(R),
+    G               = as.numeric(G),
+    B               = as.numeric(B)
+  )
+```
+
+```{r assemble-ped-table}
+# -----------------------------------------------------------------------------
+# Assemble Perry pedon-level table conforming to PEDON_PACK_PED_SCHEMA.
+# One row per peiid. Carries taxonomy labels (used as ground truth for
+# external validation, NOT as predictors).
+# -----------------------------------------------------------------------------
+
+perry_ped_table <- perry_fp_clean %>%
+  group_by(Point) %>%
+  summarise(
+    taxonname_clean = first_non_na(series_clean) %>% str_to_title(),
+    taxorder        = first_non_na(taxorder),
+    taxsuborder     = first_non_na(taxsuborder),
+    taxgrtgroup     = first_non_na(taxgrtgroup),
+    taxsubgrp_mod1  = first_non_na(taxsubgrp_mod1),
+    taxsubgrp_mod2  = first_non_na(taxsubgrp_mod2),
+    taxsubgrp_mod3  = first_non_na(taxsubgrp_mod3),
+    taxpartsize     = first_non_na(taxpartsize),
+
+    # Optional location columns - default NA when Perry has no coordinates
+    POINT_X = if ("POINT_X" %in% names(perry_fp_clean))
+                first_non_na(POINT_X) %>% as.numeric() else NA_real_,
+    POINT_Y = if ("POINT_Y" %in% names(perry_fp_clean))
+                first_non_na(POINT_Y) %>% as.numeric() else NA_real_,
+    .groups = "drop"
+  ) %>%
+  rename(peiid = Point) %>%
+  mutate(peiid = as.character(peiid)) %>%
+  distinct(peiid, .keep_all = TRUE)
+```
+
+```{r validate-and-restrict}
+# -----------------------------------------------------------------------------
+# Validate against the shared schema, then restrict to pedons present in both
+# the horizon table and the pedon table (mirrors NCSS handling).
+# -----------------------------------------------------------------------------
+
+perry_hz_table  <- perry_hz_table  %>% filter(peiid %in% perry_ped_table$peiid)
+perry_ped_table <- perry_ped_table %>% filter(peiid %in% perry_hz_table$peiid)
+
+validate_hz_schema(perry_hz_table,   source_name = "Perry horizon table")
+validate_ped_schema(perry_ped_table, source_name = "Perry pedon table")
+
+cat("Perry pedons:    ", nrow(perry_ped_table), "\n")
+cat("Perry horizons:  ", nrow(perry_hz_table),  "\n")
+cat("Mean hz/pedon:   ",
+    round(nrow(perry_hz_table) / nrow(perry_ped_table), 1), "\n")
+```
+
+```{r build-pedon-pack}
+# -----------------------------------------------------------------------------
+# Build perry_pack_150 using the IDENTICAL shared builder used by NCSS.
+# -----------------------------------------------------------------------------
+
+perry_pack_150 <- build_pedon_pack(
+  hz_table     = perry_hz_table,
+  ped_table    = perry_ped_table,
+  max_depth_cm = 150,
+  source_name  = "Perry"
+)
+
+glimpse(perry_pack_150)
+```
+
+```{r schema-compare}
+# -----------------------------------------------------------------------------
+# Compare Perry pack columns against the NCSS pack.
+# This is the diagnostic that catches future drift between the two pipelines.
+#
+# - Columns present in NCSS but missing in Perry  -> features the model
+#   trained on but Perry can't supply (will need pad_like_train_raw).
+# - Columns present in Perry but missing in NCSS  -> harmless but noteworthy.
+# - prop_hzbase_* columns will commonly differ in coverage; the values
+#   themselves are now in the same label space because both use parse_hznames.
+# -----------------------------------------------------------------------------
+
+ncss_pack_path <- list.files("../outputs", pattern = "^pedon_pack_150_.*\\.csv$",
+                             full.names = TRUE)
+
+if (length(ncss_pack_path) > 0) {
+  ncss_pack <- read_csv(ncss_pack_path[which.max(file.mtime(ncss_pack_path))],
+                        show_col_types = FALSE)
+
+  in_ncss_only  <- setdiff(names(ncss_pack), names(perry_pack_150))
+  in_perry_only <- setdiff(names(perry_pack_150), names(ncss_pack))
+  in_both       <- intersect(names(ncss_pack), names(perry_pack_150))
+
+  cat("Columns in NCSS only (", length(in_ncss_only),  "):\n  ",
+      paste(in_ncss_only,  collapse = ", "), "\n", sep = "")
+  cat("Columns in Perry only (", length(in_perry_only), "):\n  ",
+      paste(in_perry_only, collapse = ", "), "\n", sep = "")
+  cat("Columns in both (",  length(in_both),       "):\n  ",
+      paste(in_both,       collapse = ", "), "\n", sep = "")
+
+  # Numeric columns: compare distributions
+  num_cols <- intersect(in_both,
+                        names(ncss_pack)[sapply(ncss_pack, is.numeric)])
+
+  feat_compare <- map_dfr(num_cols, function(nm) {
+    n_vals <- ncss_pack[[nm]]
+    p_vals <- perry_pack_150[[nm]]
+    tibble(
+      feature           = nm,
+      ncss_pct_nonNA    = round(mean(!is.na(n_vals)) * 100, 1),
+      perry_pct_nonNA   = round(mean(!is.na(p_vals)) * 100, 1),
+      ncss_median       = round(median(n_vals,  na.rm = TRUE), 3),
+      perry_median      = round(median(p_vals,  na.rm = TRUE), 3),
+      ncss_iqr          = round(IQR(n_vals,     na.rm = TRUE), 3),
+      perry_iqr         = round(IQR(p_vals,     na.rm = TRUE), 3)
+    )
+  }) %>%
+    mutate(coverage_gap = ncss_pct_nonNA - perry_pct_nonNA) %>%
+    arrange(desc(abs(coverage_gap)))
+
+  cat("\nTop 20 features by NCSS-vs-Perry coverage gap:\n")
+  print(feat_compare %>% slice_head(n = 20), n = 20)
+} else {
+  message("No NCSS pedon_pack_150 file found in ../outputs/. ",
+          "Run NCSS_clean_pedon_pack.qmd first to enable schema comparison.")
+}
+```
+
+```{r save-outputs}
+# -----------------------------------------------------------------------------
+# Save Perry outputs.
+# -----------------------------------------------------------------------------
+
+write.csv(perry_hz_table,
+          paste0("../outputs/perry_hz_table_", Sys.Date(), ".csv"),
+          row.names = FALSE)
+
+write.csv(perry_ped_table,
+          paste0("../outputs/perry_ped_table_", Sys.Date(), ".csv"),
+          row.names = FALSE)
+
+write.csv(perry_pack_150,
+          paste0("../outputs/perry_pack_150_", Sys.Date(), ".csv"),
+          row.names = FALSE)
+
+# Also save the cleaned long-form Perry data (used downstream for
+# horizon-level validation / building per-pedon truth).
+write.csv(perry_fp_clean,
+          paste0("../outputs/perry_fp_clean_", Sys.Date(), ".csv"),
+          row.names = FALSE)
+```
