@@ -3,9 +3,355 @@ title: "scp_spatial_prediction_perry_06_30_2026"
 format: html
 ---
 
-```{r packages, message=FALSE, warning=FALSE}
-#load packages
-library(tidyverse)
+```{r}
+#| message: false
+#| warning: false
+
+# =========================
+# 1) Packages
+# =========================
+required_pkgs <- c(
+  "terra", "sf", "readxl", "dplyr",
+  "randomForest", "gstat", "automap", "sp", "tmap"
+)
+new_pkgs <- required_pkgs[!required_pkgs %in% installed.packages()[, "Package"]]
+if (length(new_pkgs)) install.packages(new_pkgs, dependencies = TRUE)
+
+library(terra)
+library(sf)
+library(readxl)
+library(dplyr)
+library(randomForest)
+library(gstat)
+library(automap)
+library(sp)
+library(tmap)
+
+set.seed(123)
+```
+
+```{r}
+# =========================
+# 2) User config
+# =========================
+base_dir    <- "C:/git/spatial_SCP_taxonomy/data (do not push)"
+spatial_dir <- file.path(base_dir, "spatial")
+
+covariate_path <- file.path(spatial_dir, "covariate_stack_3m_all_with_SR_indices.tif")
+chem_csv_path  <- file.path(spatial_dir, "soil_points_corrected_with_locations_and_chem.csv")
+tex_shp_path   <- file.path(spatial_dir, "perry_full_locs.shp")
+tex_xlsx_path  <- file.path(base_dir, "Soil data", "Surface_texture_Perry.xlsx")
+
+# OUTPUT ROOT (as requested)
+out_root <- "C:/git/spatial_SCP_taxonomy/outputs"
+out_dir  <- file.path(out_root, "perry_regression_kriging")
+png_dir  <- file.path(out_dir, "png_maps")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(png_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r}
+# =========================
+# 3) Load data
+# =========================
+covs <- rast(covariate_path)
+orig_cov_names <- names(covs)
+names(covs) <- make.names(orig_cov_names, unique = TRUE)  # safe names
+cov_names <- names(covs)
+
+# Chemical points (CID only)
+chem <- read.csv(chem_csv_path, stringsAsFactors = FALSE) %>%
+  filter(type == "CID")
+
+req_cols <- c("x", "y", "pH.2", "Ca", "K", "Mg", "Mn", "P", "Zn")
+missing_req <- setdiff(req_cols, names(chem))
+if (length(missing_req) > 0) stop("Missing chemical columns: ", paste(missing_req, collapse = ", "))
+
+chem_sf <- st_as_sf(chem, coords = c("x", "y"), crs = 4326, remove = FALSE) %>%
+  st_transform(crs(covs))
+
+# Texture points: join Point_ID (shp) to Point (xlsx)
+tex_pts <- st_read(tex_shp_path, quiet = TRUE)
+tex_tab <- read_excel(tex_xlsx_path)
+
+if (!("Point_ID" %in% names(tex_pts))) stop("Point_ID not found in perry_full_locs.shp")
+if (!("Point" %in% names(tex_tab)))   stop("Point not found in Surface_texture_Perry.xlsx")
+
+tex_join <- tex_pts %>%
+  mutate(Point_ID_chr = as.character(Point_ID)) %>%
+  left_join(tex_tab %>% mutate(Point_chr = as.character(Point)),
+            by = c("Point_ID_chr" = "Point_chr")) %>%
+  st_transform(crs(covs)) %>%
+  mutate(
+    lab_sand = as.numeric(lab_sand),
+    lab_silt = as.numeric(lab_silt),
+    lab_clay = as.numeric(lab_clay),
+    lab_texture_class = as.factor(lab_texture_class)
+  )
+
+cat("Texture rows:", nrow(tex_join), "\n")
+
+cat(
+  "Texture complete rows (sand/silt/clay):",
+  tex_join %>% 
+    sf::st_drop_geometry() %>% 
+    dplyr::summarise(n = sum(complete.cases(lab_sand, lab_silt, lab_clay))) %>% 
+    dplyr::pull(n),
+  "\n"
+)
+```
+
+```{r}
+# =========================
+# 4) RK function
+# =========================
+run_rk <- function(points_sf, response_col, cov_rast, out_prefix, out_dir, ntrees = 500) {
+  cov_names <- names(cov_rast)
+
+  ex <- extract(cov_rast, vect(points_sf), bind = TRUE) |> as.data.frame()
+
+  missing_cov <- setdiff(cov_names, names(ex))
+  if (length(missing_cov) > 0) {
+    stop("Missing covariates after extraction: ", paste(missing_cov, collapse = ", "))
+  }
+
+  dat <- ex %>%
+    dplyr::select(all_of(response_col), all_of(cov_names))
+
+  # numeric response for continuous RK
+  dat[[response_col]] <- suppressWarnings(as.numeric(dat[[response_col]]))
+  dat <- dat[complete.cases(dat[, c(response_col, cov_names)]), ]
+
+  cat(response_col, "valid rows:", nrow(dat), "\n")
+  if (nrow(dat) < 20) {
+    warning(response_col, ": too few complete points (", nrow(dat), "). Skipping.")
+    return(NULL)
+  }
+
+  idx <- as.integer(rownames(dat))
+  xy <- st_coordinates(points_sf[idx, ])
+  dat$x <- xy[,1]
+  dat$y <- xy[,2]
+
+  fml <- as.formula(paste(response_col, "~", paste(cov_names, collapse = " + ")))
+  rf <- randomForest(fml, data = dat[, c(response_col, cov_names)], ntree = ntrees, importance = TRUE)
+
+  trend_r <- predict(cov_rast, rf, na.rm = TRUE)
+  rf_pred_pts <- predict(rf, newdata = dat[, cov_names])
+  dat$resid <- dat[[response_col]] - rf_pred_pts
+
+  coordinates(dat) <- ~ x + y
+  proj4string(dat) <- CRS(crs(cov_rast, proj = TRUE))
+
+  vgm_fit <- try(autofitVariogram(resid ~ 1, dat), silent = TRUE)
+
+  if (inherits(vgm_fit, "try-error")) {
+    rk_r <- trend_r
+    krige_var <- trend_r * NA
+  } else {
+    grd <- as.data.frame(xyFromCell(cov_rast[[1]], 1:ncell(cov_rast[[1]])))
+    names(grd) <- c("x", "y")
+    coordinates(grd) <- ~ x + y
+    gridded(grd) <- TRUE
+    proj4string(grd) <- CRS(crs(cov_rast, proj = TRUE))
+
+    kr <- krige(resid ~ 1, dat, grd, model = vgm_fit$var_model)
+    kr_df <- as.data.frame(kr)
+
+    kr_resid <- rast(cbind(kr_df$x, kr_df$y, kr_df$var1.pred), type = "xyz", crs = crs(cov_rast))
+    kr_var   <- rast(cbind(kr_df$x, kr_df$y, kr_df$var1.var),  type = "xyz", crs = crs(cov_rast))
+
+    kr_resid <- resample(kr_resid, cov_rast[[1]], method = "bilinear")
+    kr_var   <- resample(kr_var,   cov_rast[[1]], method = "bilinear")
+
+    rk_r <- trend_r + kr_resid
+    krige_var <- kr_var
+  }
+
+  writeRaster(rk_r,      file.path(out_dir, paste0(out_prefix, "_RK.tif")),       overwrite = TRUE)
+  writeRaster(trend_r,   file.path(out_dir, paste0(out_prefix, "_RFtrend.tif")),  overwrite = TRUE)
+  writeRaster(krige_var, file.path(out_dir, paste0(out_prefix, "_krigevar.tif")), overwrite = TRUE)
+
+  invisible(TRUE)
+}
+```
+
+```{r}
+# =========================
+# 5) Run chemical RK
+# =========================
+chem_vars <- c("Mg", "Mn", "P", "K", "Ca", "Zn", "pH.2")
+for (v in chem_vars) {
+  run_rk(chem_sf, v, covs, paste0("chem_", v), out_dir = out_dir)
+}
+```
+
+```{r}
+# =========================
+# 6) Run texture RK (%)
+# =========================
+run_rk(tex_join, "lab_sand", covs, "texture_Sand", out_dir = out_dir)
+run_rk(tex_join, "lab_silt", covs, "texture_Silt", out_dir = out_dir)
+run_rk(tex_join, "lab_clay", covs, "texture_Clay", out_dir = out_dir)
+```
+
+```{r}
+# =========================
+# 7) Normalize texture to 100%
+# =========================
+sand <- rast(file.path(out_dir, "texture_Sand_RK.tif"))
+silt <- rast(file.path(out_dir, "texture_Silt_RK.tif"))
+clay <- rast(file.path(out_dir, "texture_Clay_RK.tif"))
+
+tex_stack <- c(sand, silt, clay)
+names(tex_stack) <- c("Sand", "Silt", "Clay")
+tex_stack <- clamp(tex_stack, lower = 0, values = TRUE)
+
+sum_tex <- app(tex_stack, sum, na.rm = TRUE)
+
+sand_n <- (tex_stack$Sand / sum_tex) * 100
+silt_n <- (tex_stack$Silt / sum_tex) * 100
+clay_n <- (tex_stack$Clay / sum_tex) * 100
+
+sand_n[sum_tex == 0] <- NA
+silt_n[sum_tex == 0] <- NA
+clay_n[sum_tex == 0] <- NA
+
+tex_norm <- c(sand_n, silt_n, clay_n)
+names(tex_norm) <- c("Sand_pct", "Silt_pct", "Clay_pct")
+
+writeRaster(tex_norm, file.path(out_dir, "texture_percent_RK_normalized.tif"), overwrite = TRUE)
+
+sum_check <- app(tex_norm, sum, na.rm = TRUE)
+writeRaster(sum_check, file.path(out_dir, "texture_percent_sum_check.tif"), overwrite = TRUE)
+
+plot(tex_norm)
+plot(sum_check, main = "Sand+Silt+Clay (should be ~100)")
+```
+
+```{r}
+# =========================
+# 8) Texture class RF map (optional)
+# =========================
+ex_t <- extract(covs, vect(tex_join), bind = TRUE) |> as.data.frame()
+
+dat_t <- ex_t %>%
+  dplyr::select(lab_texture_class, all_of(names(covs))) %>%
+  mutate(lab_texture_class = as.factor(lab_texture_class)) %>%
+  filter(!is.na(lab_texture_class))
+
+dat_t <- dat_t[complete.cases(dat_t[, c("lab_texture_class", names(covs))]), ]
+
+if (nrow(dat_t) >= 20 && nlevels(dat_t$lab_texture_class) >= 2) {
+  rf_cls <- randomForest(lab_texture_class ~ ., data = dat_t[, c("lab_texture_class", names(covs))], ntree = 500)
+
+  cls_r <- predict(covs, rf_cls, type = "response", na.rm = TRUE)
+  writeRaster(cls_r, file.path(out_dir, "texture_class_RFclass.tif"), overwrite = TRUE)
+
+  prob_r <- predict(covs, rf_cls, type = "prob", na.rm = TRUE)
+  writeRaster(prob_r, file.path(out_dir, "texture_class_RFprobabilities.tif"), overwrite = TRUE)
+}
+```
+
+```{r}
+# =========================
+# 9) Export quick PNG maps (terra plot -> PNG)
+# =========================
+rk_files <- list.files(out_dir, pattern = "_RK\\.tif$", full.names = TRUE)
+
+for (f in rk_files) {
+  nm <- tools::file_path_sans_ext(basename(f))
+  png(file.path(png_dir, paste0(nm, ".png")), width = 2000, height = 1400, res = 200)
+  plot(rast(f), main = nm)
+  dev.off()
+}
+
+# Uncertainty example
+if (file.exists(file.path(out_dir, "chem_Mg_krigevar.tif"))) {
+  png(file.path(png_dir, "chem_Mg_krigevar.png"), width = 2000, height = 1400, res = 200)
+  plot(rast(file.path(out_dir, "chem_Mg_krigevar.tif")), main = "chem_Mg_krigevar")
+  dev.off()
+}
+
+cat("Done. Outputs in:\n", out_dir, "\n")
+cat("PNG maps in:\n", png_dir, "\n")
+```
+
+```{r}
+#visualize all maps in session:
+#| label: visualize-all-outputs
+#| message: false
+#| warning: false
+
+library(terra)
+
+out_dir <- "C:/git/spatial_SCP_taxonomy/outputs/perry_regression_kriging"
+png_dir <- file.path(out_dir, "png_maps")
+dir.create(png_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ---------- helper ----------
+save_plot_png <- function(r, title_txt, file_png, colr = hcl.colors(24, "Viridis")) {
+  png(file_png, width = 2200, height = 1600, res = 220)
+  plot(r, main = title_txt, col = colr)
+  dev.off()
+}
+
+# ---------- 1) RK prediction maps ----------
+rk_files <- list.files(out_dir, pattern = "_RK\\.tif$", full.names = TRUE)
+if (length(rk_files) > 0) {
+  for (f in rk_files) {
+    r  <- rast(f)
+    nm <- tools::file_path_sans_ext(basename(f))
+    plot(r, main = nm, col = hcl.colors(24, "Viridis"))
+    save_plot_png(r, nm, file.path(png_dir, paste0(nm, ".png")), colr = hcl.colors(24, "Viridis"))
+  }
+} else {
+  message("No *_RK.tif files found.")
+}
+
+# ---------- 2) Kriging variance maps ----------
+kv_files <- list.files(out_dir, pattern = "_krigevar\\.tif$", full.names = TRUE)
+if (length(kv_files) > 0) {
+  for (f in kv_files) {
+    r  <- rast(f)
+    nm <- tools::file_path_sans_ext(basename(f))
+    plot(r, main = nm, col = hcl.colors(24, "YlOrRd"))
+    save_plot_png(r, nm, file.path(png_dir, paste0(nm, ".png")), colr = hcl.colors(24, "YlOrRd"))
+  }
+} else {
+  message("No *_krigevar.tif files found.")
+}
+
+# ---------- 3) Texture normalized % ----------
+tex_norm_path <- file.path(out_dir, "texture_percent_RK_normalized.tif")
+if (file.exists(tex_norm_path)) {
+  tex_norm <- rast(tex_norm_path)   # Sand_pct, Silt_pct, Clay_pct
+  plot(tex_norm, col = hcl.colors(24, "YlOrBr"))
+  
+  # also save each layer
+  for (i in 1:nlyr(tex_norm)) {
+    nm <- names(tex_norm)[i]
+    save_plot_png(tex_norm[[i]], nm,
+                  file.path(png_dir, paste0("texture_", nm, ".png")),
+                  colr = hcl.colors(24, "YlOrBr"))
+  }
+} else {
+  message("texture_percent_RK_normalized.tif not found.")
+}
+
+# ---------- 4) Texture sum-check ----------
+sum_check_path <- file.path(out_dir, "texture_percent_sum_check.tif")
+if (file.exists(sum_check_path)) {
+  sc <- rast(sum_check_path)
+  plot(sc, main = "Texture % Sum Check (should be ~100)", col = hcl.colors(24, "RdYlBu"))
+  save_plot_png(sc, "Texture % Sum Check (should be ~100)",
+                file.path(png_dir, "texture_percent_sum_check.png"),
+                colr = hcl.colors(24, "RdYlBu"))
+} else {
+  message("texture_percent_sum_check.tif not found.")
+}
+
+cat("Visualization done.\nPNG maps saved to:\n", png_dir, "\n")
 
 ```
 
