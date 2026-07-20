@@ -355,3 +355,193 @@ cat("Visualization done.\nPNG maps saved to:\n", png_dir, "\n")
 
 ```
 
+```{r}
+#ordinary kriging for all chemical variables
+#| label: ordinary-kriging-no-covars
+#| message: true
+#| warning: true
+
+library(terra)
+library(sf)
+library(readxl)
+library(dplyr)
+library(sp)
+library(gstat)
+library(automap)
+
+set.seed(123)
+
+# ---------------- paths ----------------
+base_dir    <- "C:/git/spatial_SCP_taxonomy/data (do not push)"
+spatial_dir <- file.path(base_dir, "spatial")
+
+cov_path    <- file.path(spatial_dir, "covariate_stack_3m_all_with_SR_indices.tif")
+chem_csv    <- file.path(spatial_dir, "soil_points_corrected_with_locations_and_chem.csv")
+tex_shp     <- file.path(spatial_dir, "perry_full_locs.shp")
+tex_xlsx    <- file.path(base_dir, "Soil data", "Surface_texture_Perry.xlsx")
+
+out_root    <- "C:/git/spatial_SCP_taxonomy/outputs"
+ok_dir      <- file.path(out_root, "perry_ordinary_kriging_no_covars")
+dir.create(ok_dir, recursive = TRUE, showWarnings = FALSE)
+
+# template raster defines extent/resolution/CRS for prediction
+template <- rast(cov_path)[[1]]
+
+# ---------------- load chemical points (CID only) ----------------
+chem <- read.csv(chem_csv, stringsAsFactors = FALSE) %>%
+  filter(type == "CID")
+
+chem_sf <- st_as_sf(chem, coords = c("x", "y"), crs = 4326, remove = FALSE) %>%
+  st_transform(crs(template))
+
+# ---------------- load texture points ----------------
+pts <- st_read(tex_shp, quiet = TRUE)
+tex <- read_excel(tex_xlsx)
+
+tex_sf <- pts %>%
+  mutate(Point_ID_chr = as.character(Point_ID)) %>%
+  left_join(tex %>% mutate(Point_chr = as.character(Point)),
+            by = c("Point_ID_chr" = "Point_chr")) %>%
+  st_transform(crs(template)) %>%
+  mutate(
+    lab_sand = as.numeric(lab_sand),
+    lab_silt = as.numeric(lab_silt),
+    lab_clay = as.numeric(lab_clay)
+  )
+
+# ---------------- helper: ordinary kriging ----------------
+run_ok <- function(points_sf, value_col, out_prefix, template_r, out_dir) {
+  df <- sf::st_drop_geometry(points_sf)
+
+  if (!value_col %in% names(df)) {
+    warning("Column not found: ", value_col, " (skipping)")
+    return(invisible(NULL))
+  }
+
+  z <- suppressWarnings(as.numeric(df[[value_col]]))
+  keep <- is.finite(z)
+  if (sum(keep) < 20) {
+    warning(value_col, ": too few valid points (", sum(keep), "), skipping.")
+    return(invisible(NULL))
+  }
+
+  pts_use <- points_sf[keep, ]
+  xy <- sf::st_coordinates(pts_use)
+
+  d <- data.frame(x = xy[,1], y = xy[,2], z = z[keep])
+
+  # 1) collapse duplicate coordinates by mean (critical for zero-distance semivariance issues)
+  d <- d %>%
+    group_by(x, y) %>%
+    summarise(z = mean(z, na.rm = TRUE), .groups = "drop")
+
+  if (nrow(d) < 20) {
+    warning(value_col, ": too few unique coordinate points after dedup (", nrow(d), ").")
+    return(invisible(NULL))
+  }
+
+  coordinates(d) <- ~ x + y
+  proj4string(d) <- CRS(crs(template_r, proj = TRUE))
+
+  # empirical variogram
+  v_emp <- variogram(z ~ 1, d)
+
+  # helper to try fitting a specific model with safer fit.method
+  try_fit <- function(model_name) {
+    # reasonable initials
+    psill0 <- max(var(d$z, na.rm = TRUE), .Machine$double.eps)
+    rng0   <- max(diff(range(coordinates(d)[,1]))/4, 1)
+
+    m0 <- vgm(psill = psill0, model = model_name, range = rng0, nugget = psill0 * 0.1)
+
+    fit <- try(fit.variogram(v_emp, model = m0, fit.method = 6), silent = TRUE)
+    if (inherits(fit, "try-error")) return(NULL)
+    if (any(!is.finite(fit$psill)) || any(!is.finite(fit$range))) return(NULL)
+    fit
+  }
+
+  # 2) safer model set (avoid Ste/Mat causing bessel_k issues)
+  candidate_models <- c("Exp", "Sph", "Gau")
+  v_fit <- NULL
+  for (m in candidate_models) {
+    v_fit <- try_fit(m)
+    if (!is.null(v_fit)) {
+      message(value_col, ": fitted variogram model = ", m)
+      break
+    }
+  }
+
+  if (is.null(v_fit)) {
+    warning(value_col, ": all variogram fits failed; skipping.")
+    return(invisible(NULL))
+  }
+
+  # prediction grid from template extent/resolution
+  grd <- as.data.frame(xyFromCell(template_r, 1:ncell(template_r)))
+  names(grd) <- c("x", "y")
+  coordinates(grd) <- ~ x + y
+  gridded(grd) <- TRUE
+  proj4string(grd) <- CRS(crs(template_r, proj = TRUE))
+
+  kr <- krige(z ~ 1, d, newdata = grd, model = v_fit)
+
+  kr_df <- as.data.frame(kr)
+  pred_r <- rast(cbind(kr_df$x, kr_df$y, kr_df$var1.pred), type = "xyz", crs = crs(template_r))
+  var_r  <- rast(cbind(kr_df$x, kr_df$y, kr_df$var1.var),  type = "xyz", crs = crs(template_r))
+
+  pred_r <- resample(pred_r, template_r, method = "bilinear")
+  var_r  <- resample(var_r,  template_r, method = "bilinear")
+
+  writeRaster(pred_r, file.path(out_dir, paste0(out_prefix, "_OK.tif")), overwrite = TRUE)
+  writeRaster(var_r,  file.path(out_dir, paste0(out_prefix, "_OKvar.tif")), overwrite = TRUE)
+
+  message("Saved: ", out_prefix)
+  invisible(TRUE)
+}
+# ---------------- run chemical OK ----------------
+chem_vars <- c("Mg", "Mn", "P", "K", "Ca", "Zn", "pH.2")
+for (v in chem_vars) {
+  run_ok(chem_sf, v, paste0("chem_", v), template, ok_dir)
+}
+
+# ---------------- run texture OK (continuous only) ----------------
+tex_vars <- c("lab_sand", "lab_silt", "lab_clay")
+for (v in tex_vars) {
+  run_ok(tex_sf, v, paste0("texture_", v), template, ok_dir)
+}
+
+# ---------------- normalize texture % to 100 (optional) ----------------
+sand_f <- file.path(ok_dir, "texture_lab_sand_OK.tif")
+silt_f <- file.path(ok_dir, "texture_lab_silt_OK.tif")
+clay_f <- file.path(ok_dir, "texture_lab_clay_OK.tif")
+
+if (file.exists(sand_f) && file.exists(silt_f) && file.exists(clay_f)) {
+  sand <- rast(sand_f); silt <- rast(silt_f); clay <- rast(clay_f)
+
+  tex_stack <- c(sand, silt, clay)
+  names(tex_stack) <- c("Sand", "Silt", "Clay")
+  tex_stack <- clamp(tex_stack, lower = 0, values = TRUE)
+
+  s <- app(tex_stack, sum, na.rm = TRUE)
+  sand_n <- (tex_stack$Sand / s) * 100
+  silt_n <- (tex_stack$Silt / s) * 100
+  clay_n <- (tex_stack$Clay / s) * 100
+  sand_n[s == 0] <- NA; silt_n[s == 0] <- NA; clay_n[s == 0] <- NA
+
+  tex_norm <- c(sand_n, silt_n, clay_n)
+  names(tex_norm) <- c("Sand_pct", "Silt_pct", "Clay_pct")
+
+  sum_check <- app(tex_norm, sum, na.rm = TRUE)
+
+  writeRaster(tex_norm, file.path(ok_dir, "texture_percent_OK_normalized.tif"), overwrite = TRUE)
+  writeRaster(sum_check, file.path(ok_dir, "texture_percent_OK_sum_check.tif"), overwrite = TRUE)
+}
+
+cat("\nDone. Ordinary kriging outputs written to:\n", ok_dir, "\n")
+
+
+
+
+```
+
+
