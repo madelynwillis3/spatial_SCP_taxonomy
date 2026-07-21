@@ -543,5 +543,208 @@ cat("\nDone. Ordinary kriging outputs written to:\n", ok_dir, "\n")
 
 
 ```
+```{r}
+#clip and change to lbs/ac
+#| label: clip-and-convert-outputs
+#| message: true
+#| warning: false
+
+library(terra)
+
+# ---------------- paths ----------------
+cov_path <- "C:/git/spatial_SCP_taxonomy/data (do not push)/spatial/covariate_stack_3m_all_with_SR_indices.tif"
+
+# source folder with existing outputs (RK or OK, whichever you want to process)
+src_dir <- "C:/git/spatial_SCP_taxonomy/outputs/perry_regression_kriging"
+# e.g. for OK outputs, use:
+# src_dir <- "C:/git/spatial_SCP_taxonomy/outputs/perry_ordinary_kriging_no_covars"
+
+out_dir <- file.path(src_dir, "clipped_and_lbsac")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ---------------- template extent ----------------
+tmpl <- rast(cov_path)[[1]]  # extent, resolution, CRS template
+
+# ---------------- find rasters ----------------
+r_files <- list.files(src_dir, pattern = "\\.tif$", full.names = TRUE)
+
+# avoid recursively reprocessing already-created folder
+r_files <- r_files[!grepl("clipped_and_lbsac", r_files, fixed = TRUE)]
+
+# chemical vars to convert (ppm -> lbs/ac)
+chem_vars <- c("Ca", "K", "Mg", "Mn", "P", "Zn")
+
+for (f in r_files) {
+  r <- rast(f)
+
+  # align geometry to template if needed
+  if (!compareGeom(r, tmpl, stopOnError = FALSE, crs = TRUE, ext = FALSE, rowcol = FALSE, res = FALSE)) {
+    # only reproject if CRS differs
+    if (!same.crs(r, tmpl)) {
+      r <- project(r, tmpl, method = "bilinear")
+    }
+  }
+
+  # clip to covariate extent
+  r_clip <- crop(r, tmpl)
+  # optional exact mask (same as extent rectangle here, but keeps outside as NA if needed)
+  r_clip <- mask(r_clip, tmpl)
+
+  nm <- tools::file_path_sans_ext(basename(f))
+  r_out <- r_clip
+
+  # Convert ppm -> lbs/ac for chemical prediction layers only, not pH
+  # Applies to names like chem_Ca_RK, chem_P_OK, etc.
+  if (grepl("^chem_", nm) && !grepl("pH", nm, ignore.case = TRUE)) {
+    # ensure one of target analytes is in the filename
+    if (any(grepl(paste0("_", chem_vars, "(_|$)"), nm))) {
+      r_out <- r_clip * 2
+      nm <- paste0(nm, "_lbsac")
+    }
+  }
+
+  writeRaster(r_out, file.path(out_dir, paste0(nm, ".tif")), overwrite = TRUE)
+  cat("Saved:", paste0(nm, ".tif"), "\n")
+}
+
+cat("\nDone.\nOutput folder:\n", out_dir, "\n")
+```
+
+```{r}
+#with OK 
+library(terra)
+
+cov_path <- "C:/git/spatial_SCP_taxonomy/data (do not push)/spatial/covariate_stack_3m_all_with_SR_indices.tif"
+src_dir  <- "C:/git/spatial_SCP_taxonomy/outputs/perry_ordinary_kriging_no_covars"
+out_dir  <- file.path(src_dir, "clipped_and_lbsac")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+tmpl <- rast(cov_path)[[1]]
+
+r_files <- list.files(src_dir, pattern = "\\.tif$", full.names = TRUE)
+r_files <- r_files[!grepl("clipped_and_lbsac", r_files, fixed = TRUE)]
+
+for (f in r_files) {
+  r <- rast(f)
+  nm <- tools::file_path_sans_ext(basename(f))
+
+  if (!same.crs(r, tmpl)) r <- project(r, tmpl, method = "bilinear")
+  r2 <- mask(crop(r, tmpl), tmpl)
+
+  is_chem_ok <- grepl("^chem_", nm) && grepl("_OK$", nm)
+  is_ph      <- grepl("pH", nm, ignore.case = TRUE)
+  is_var     <- grepl("OKvar$", nm)
+
+  nm_out <- if (is_chem_ok && !is_ph && !is_var) paste0(nm, "_lbsac") else nm
+  out_file <- file.path(out_dir, paste0(nm_out, ".tif"))
+
+  # critical: remove existing file first
+  if (file.exists(out_file)) file.remove(out_file)
+
+  writeRaster(r2, out_file, overwrite = TRUE)
+  cat("Saved:", out_file, "\n")
+}
+```
+```{r}
+#forgot about lbc:
+library(terra)
+library(sf)
+library(dplyr)
+library(sp)
+library(gstat)
+library(automap)
+
+# ---------- paths ----------
+base_dir    <- "C:/git/spatial_SCP_taxonomy/data (do not push)"
+spatial_dir <- file.path(base_dir, "spatial")
+
+cov_path <- file.path(spatial_dir, "covariate_stack_3m_all_with_SR_indices.tif")
+chem_csv <- file.path(spatial_dir, "soil_points_corrected_with_locations_and_chem.csv")
+
+out_dir  <- "C:/git/spatial_SCP_taxonomy/outputs/perry_ordinary_kriging_no_covars/clipped_and_lbsac"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+template <- rast(cov_path)[[1]]
+
+# ---------- load chemistry ----------
+chem <- read.csv(chem_csv, stringsAsFactors = FALSE) %>%
+  filter(type == "CID")
+
+chem_sf <- st_as_sf(chem, coords = c("x", "y"), crs = 4326, remove = FALSE) %>%
+  st_transform(crs(template))
+
+# ---------- find lime buffer column ----------
+nm <- names(chem_sf)
+cand <- nm[grepl("lbc.1", nm, ignore.case = TRUE)]
+print(cand)
+
+# set this to the correct column name from print(cand):
+lb_col <- cand[1]
+if (is.na(lb_col) || length(lb_col) == 0) stop("No lime buffer column found.")
+
+# ---------- build dataset ----------
+vals <- suppressWarnings(as.numeric(st_drop_geometry(chem_sf)[[lb_col]]))
+keep <- is.finite(vals)
+if (sum(keep) < 20) stop("Too few valid Lime Buffer points: ", sum(keep))
+
+pts <- chem_sf[keep, ]
+xy  <- st_coordinates(pts)
+d   <- data.frame(x = xy[,1], y = xy[,2], z = vals[keep]) %>%
+  group_by(x, y) %>%
+  summarise(z = mean(z, na.rm = TRUE), .groups = "drop")
+
+coordinates(d) <- ~x+y
+proj4string(d) <- CRS(crs(template, proj = TRUE))
+
+# ---------- variogram + OK ----------
+v_emp <- variogram(z ~ 1, d)
+
+fit_try <- function(model_name) {
+  psill0 <- max(var(d$z, na.rm = TRUE), .Machine$double.eps)
+  rng0   <- max(diff(range(coordinates(d)[,1])) / 4, 1)
+  m0 <- vgm(psill = psill0, model = model_name, range = rng0, nugget = psill0 * 0.1)
+  fit <- try(fit.variogram(v_emp, m0, fit.method = 6), silent = TRUE)
+  if (inherits(fit, "try-error")) return(NULL)
+  fit
+}
+
+v_fit <- NULL
+for (m in c("Exp","Sph","Gau")) {
+  v_fit <- fit_try(m)
+  if (!is.null(v_fit)) {
+    message("Fitted variogram: ", m)
+    break
+  }
+}
+if (is.null(v_fit)) stop("Variogram fit failed for Lime Buffer Capacity.")
+
+grd <- as.data.frame(xyFromCell(template, 1:ncell(template)))
+names(grd) <- c("x","y")
+coordinates(grd) <- ~x+y
+gridded(grd) <- TRUE
+proj4string(grd) <- CRS(crs(template, proj = TRUE))
+
+kr <- krige(z ~ 1, d, grd, model = v_fit)
+kr_df <- as.data.frame(kr)
+
+pred <- rast(cbind(kr_df$x, kr_df$y, kr_df$var1.pred), type = "xyz", crs = crs(template))
+kvar <- rast(cbind(kr_df$x, kr_df$y, kr_df$var1.var),  type = "xyz", crs = crs(template))
+
+pred <- mask(crop(resample(pred, template, method = "bilinear"), template), template)
+kvar <- mask(crop(resample(kvar, template, method = "bilinear"), template), template)
+
+# safe file stem
+stem <- gsub("[^A-Za-z0-9_]+", "_", lb_col)
+f_ok    <- file.path(out_dir, paste0("chem_", stem, "_OK.tif"))
+f_okvar <- file.path(out_dir, paste0("chem_", stem, "_OKvar.tif"))
+
+if (file.exists(f_ok)) file.remove(f_ok)
+if (file.exists(f_okvar)) file.remove(f_okvar)
+
+writeRaster(pred, f_ok, overwrite = TRUE)
+writeRaster(kvar, f_okvar, overwrite = TRUE)
+
+cat("Saved:\n", f_ok, "\n", f_okvar, "\n")
+```
 
 
