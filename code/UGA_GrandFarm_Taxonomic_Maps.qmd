@@ -1,0 +1,966 @@
+---
+title: "Perry Map Products"
+subtitle: "UGA GrandFarm -- Perry, Georgia"
+author: "Madelyn Willis"
+date: today
+format:
+  pdf:
+    documentclass: article
+    papersize: letter
+    geometry:
+      - top=0.6in
+      - bottom=0.6in
+      - left=0.6in
+      - right=0.6in
+    fig-pos: "H"
+    keep-tex: false
+    colorlinks: true
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+knitr:
+  opts_chunk:
+    dev: "ragg_png"
+    dpi: 300
+---
+
+```{r setup}
+#| include: false
+
+## ---------------------------------------------------------------------------
+## Packages
+## ---------------------------------------------------------------------------
+## install.packages(c("terra","sf","tmap","ragg","grid","RColorBrewer"))
+library(terra)
+library(sf)
+library(tmap)
+library(grid)
+
+sf::sf_use_s2(FALSE)
+terra::terraOptions(progress = 0)
+
+## tmap v3 and v4 have different APIs. Everything below routes through the
+## helpers in the next chunk so the document renders under either version.
+TMAP4 <- utils::packageVersion("tmap") >= "4.0.0"
+message("tmap version detected: ", as.character(utils::packageVersion("tmap")),
+        if (TMAP4) "  (v4 API)" else "  (v3 API)")
+
+tmap_mode("plot")
+
+## In v4, components rescale themselves per panel. In a 3-panel arrangement the
+## rescaling can collapse a legend to zero/NA width, which throws
+##   Error in if (tail(xright, 1) > W) : missing value where TRUE/FALSE needed
+## Turning autoscale off keeps component sizing deterministic.
+if (TMAP4) tmap_options(component.autoscale = FALSE)
+```
+
+```{r smoke-test}
+#| include: false
+
+## Renders one map with default settings. If THIS fails the problem is the data
+## or the tmap install, not the styling below. Set include: true to inspect.
+.smoke <- function() {
+  r <- terra::rast(file.path(dir_krige, "chem_Ca_OK_lbsac.tif"))
+  print(tm_shape(r) + tm_raster())
+  invisible(TRUE)
+}
+```
+
+```{r paths}
+#| include: false
+
+## ---------------------------------------------------------------------------
+## PATHS -- edit these three if the projects move
+## ---------------------------------------------------------------------------
+dir_krige  <- "C:/git/spatial_SCP_taxonomy/outputs/perry_ordinary_kriging_no_covars/clipped_and_lbsac"
+dir_series <- "C:/git/coastal_plain_taxonomy/outputs/spatial"
+path_border <- "C:/Users/Madelyn Willis/OneDrive/Documents/perry_git/perry/Mapping/Data/Border/border_17N.shp"
+
+## WHERE THE PDFs GO
+dir_out <- "C:/git/spatial_SCP_taxonomy/outputs/maps"
+dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(dir.exists(dir_krige), dir.exists(dir_series), file.exists(path_border))
+
+## ---------------------------------------------------------------------------
+## Site border -- NAD83 / UTM 17N (EPSG:26917), same CRS as the kriged rasters
+## ---------------------------------------------------------------------------
+border <- sf::st_read(path_border, quiet = TRUE)
+border <- sf::st_transform(border, 26917)
+border <- sf::st_zm(border, drop = TRUE)          # drop Z/M left over from the KML export
+TARGET_CRS <- 26917
+```
+
+```{r helpers}
+#| include: false
+
+## ---------------------------------------------------------------------------
+## Version-safe tmap wrappers
+## ---------------------------------------------------------------------------
+
+## Palette names differ between versions: v4 uses "brewer.yl_gn_bu",
+## v3 wants the classic RColorBrewer name "YlGnBu".
+pal_v3 <- c(
+  "brewer.yl_gn_bu" = "YlGnBu", "brewer.pu_bu_gn" = "PuBuGn",
+  "brewer.yl_or_br" = "YlOrBr", "brewer.yl_gn"    = "YlGn",
+  "brewer.rd_yl_bu" = "RdYlBu", "brewer.bu_pu"    = "BuPu",
+  "brewer.bu_gn"    = "BuGn",   "brewer.or_rd"    = "OrRd",
+  "viridis"         = "viridis"
+)
+resolve_pal <- function(pal) {
+  if (TMAP4) return(pal)
+  if (pal %in% names(pal_v3)) unname(pal_v3[pal]) else pal
+}
+
+## Continuous raster layer with a readable legend.
+##
+## NOTE: legend titles must be SINGLE-LINE. tmap measures a legend title as one
+## string; an embedded "\n" makes the measured width NA, which surfaces later as
+##   Error in if (tail(xright, 1) > W) : missing value where TRUE/FALSE needed
+## Put units in parentheses on the same line instead.
+tm_raster_safe <- function(pal, title, n_breaks = 6) {
+  pal   <- resolve_pal(pal)
+  title <- gsub("[\r\n]+", " ", title)
+  if (TMAP4) {
+    tm_raster(
+      col.scale  = tm_scale_intervals(n = n_breaks, style = "quantile", values = pal),
+      col.legend = tm_legend(title = title, reverse = TRUE,
+                             position = tm_pos_out("right", "center"))
+    )
+  } else {
+    tm_raster(
+      style   = "quantile",
+      n       = n_breaks,
+      palette = pal,
+      title   = title,
+      legend.reverse = TRUE
+    )
+  }
+}
+
+## Categorical polygon fill with an explicit named palette
+tm_polys_safe <- function(field, pal, title, legend_ncol = 1,
+                          border_col = "grey25", border_lwd = 0.35) {
+  title <- gsub("[\r\n]+", " ", title)
+  if (TMAP4) {
+    tm_polygons(
+      fill       = field,
+      ## no value.na / label.na -- every polygon is recoded to a real class,
+      ## so there is no "No data" entry in the legend
+      fill.scale = tm_scale_categorical(values = pal),
+      fill.legend = tm_legend(title = title, ncol = legend_ncol,
+                              position = tm_pos_out("right", "center")),
+      col        = border_col,
+      lwd        = border_lwd
+    )
+  } else {
+    tm_polygons(
+      col          = field,
+      palette      = pal,
+      title        = title,
+      border.col   = border_col,
+      lwd          = border_lwd,
+      colorNA      = "grey85",
+      textNA       = "No data",
+      legend.is.portrait = TRUE
+    )
+  }
+}
+
+## Scale bar -- renamed between v3 and v4.
+##
+## IMPORTANT: do NOT hardcode `breaks`. If the requested breaks are wider than
+## the panel, tmap warns "Not all scale bar breaks could be plotted" and then
+## immediately fails with
+##   Error in if (tail(xright, 1) > W) : missing value where TRUE/FALSE needed
+## because the unplaced break leaves xright = NA. Letting tmap choose breaks
+## from the actual panel width avoids this at any figure size.
+##
+## If you want fixed breaks back, pass e.g. breaks = c(0, 250, 500) AND raise
+## the chunk's fig-width, then confirm no warning appears.
+## Placed OUTSIDE the map frame, underneath the map shape, via tm_pos_out() --
+## an inside position overlaps the southern edge of the site polygon.
+tm_scalebar_safe <- function(breaks = NULL, position = NULL, text.size = 0.6) {
+  if (TMAP4) {
+    if (is.null(position)) position <- tm_pos_out("center", "bottom")
+    if (is.null(breaks)) {
+      tm_scalebar(position = position, text.size = text.size)
+    } else {
+      tm_scalebar(breaks = breaks, position = position, text.size = text.size)
+    }
+  } else {
+    if (is.null(position)) position <- c("left", "bottom")
+    if (is.null(breaks)) {
+      tm_scale_bar(position = position, text.size = text.size)
+    } else {
+      tm_scale_bar(breaks = breaks, position = position, text.size = text.size)
+    }
+  }
+}
+
+## Compass rose
+tm_compass_safe <- function(position = c("right", "top"), size = 2.2) {
+  if (TMAP4) {
+    tm_compass(type = "rose", size = size, position = position, text.size = 0.55)
+  } else {
+    tm_compass(type = "rose", size = size, position = position,
+               text.size = 0.55, show.labels = 1)
+  }
+}
+
+## ---------------------------------------------------------------------------
+## Label placement.
+##
+## tm_text() on a polygon layer uses the polygon CENTROID, which for concave or
+## crescent-shaped map units can fall OUTSIDE the polygon it belongs to.
+## st_point_on_surface() is guaranteed to return a point inside the geometry,
+## so labels always sit in the unit they describe.
+##
+## Rows with a blank / "Unknown" label are dropped here rather than drawn.
+## ---------------------------------------------------------------------------
+label_points <- function(x, field) {
+  v <- trimws(as.character(x[[field]]))
+  keep <- !is.na(v) & v != "" & !toupper(v) %in% c("UNKNOWN", "NA", "<NA>")
+  x <- x[keep, ]
+  if (nrow(x) == 0) return(x)
+  suppressWarnings(sf::st_point_on_surface(x))
+}
+
+## ---------------------------------------------------------------------------
+## Dissolve polygons by an attribute, so shared internal edges disappear.
+##
+## SSURGO_matchup is an INTERSECTION of the SSURGO units with our soil series
+## polygons, so its outlines are a mixture of both line networks. Dissolving on
+## MUKEY collapses the intersection slivers and recovers the true SSURGO unit
+## boundaries, which can then be drawn on their own.
+## ---------------------------------------------------------------------------
+dissolve_by <- function(x, field) {
+  keys  <- as.character(x[[field]])
+  keys[is.na(keys) | keys == ""] <- "__blank__"
+  uk    <- unique(keys)
+  parts <- lapply(uk, function(k) sf::st_union(x[keys == k, ]))
+  sf::st_sf(
+    stats::setNames(data.frame(uk, stringsAsFactors = FALSE), field),
+    geometry = do.call(c, parts),
+    crs      = sf::st_crs(x)
+  )
+}
+
+## Manual legend entry for line styles -- "line" in v3, "lines" in v4
+tm_line_legend_safe <- function(labels, col, lty, lwd, title = "") {
+  if (TMAP4) {
+    tm_add_legend(type = "lines", labels = labels, col = col,
+                  lty = lty, lwd = lwd, title = title,
+                  position = tm_pos_out("right", "center"))
+  } else {
+    tm_add_legend(type = "line", labels = labels, col = col,
+                  lty = lty, lwd = lwd, title = title)
+  }
+}
+
+## Polygon labels (map unit symbols)
+tm_text_safe <- function(field, size = 0.4) {
+  if (TMAP4) {
+    tm_text(text = field, size = size, col = "grey10")
+  } else {
+    tm_text(text = field, size = size, col = "grey10", shadow = TRUE)
+  }
+}
+
+## Shared title + layout used by every panel.
+## v4 moved the panel title out of tm_layout() into its own tm_title() layer.
+panel_layout <- function(title) {
+  title <- gsub("[\r\n]+", " ", title)
+  if (TMAP4) {
+    tm_title(title, size = 0.9, fontface = "bold") +
+      tm_layout(
+        legend.title.size = 0.75,
+        legend.text.size  = 0.58,
+        frame         = TRUE,
+        frame.lwd     = 0.8,
+        inner.margins = c(0.03, 0.03, 0.06, 0.03),
+        outer.margins = c(0.01, 0.01, 0.01, 0.01),
+        bg.color      = "white"
+      )
+  } else {
+    tm_layout(
+      main.title          = title,
+      main.title.size     = 0.9,
+      main.title.fontface = "bold",
+      main.title.position = "left",
+      legend.outside          = TRUE,
+      legend.outside.position = "right",
+      legend.outside.size     = 0.26,
+      legend.title.size       = 0.75,
+      legend.text.size        = 0.58,
+      frame         = TRUE,
+      frame.lwd     = 0.8,
+      inner.margins = c(0.03, 0.03, 0.03, 0.03),
+      outer.margins = c(0.01, 0.01, 0.01, 0.01),
+      bg.color      = "white"
+    )
+  }
+}
+
+## ---------------------------------------------------------------------------
+## One continuous raster -> one finished map panel
+## ---------------------------------------------------------------------------
+make_raster_map <- function(file, title, legend_title, pal = "viridis",
+                            band = 1, n_breaks = 6, mult = 1) {
+  r <- terra::rast(file.path(dir_krige, file))
+  if (terra::nlyr(r) > 1) r <- r[[band]]
+  if (mult != 1) r <- r * mult
+  if (!terra::same.crs(r, paste0("EPSG:", TARGET_CRS))) {
+    r <- terra::project(r, paste0("EPSG:", TARGET_CRS))
+  }
+  ## Layer name feeds tmap's default legend title -- keep it a plain,
+  ## single-line, syntactically valid name.
+  names(r) <- make.names(gsub("[\r\n]+", " ", legend_title))
+
+  tm_shape(r, bbox = sf::st_bbox(border)) +
+    tm_raster_safe(pal = pal, title = legend_title, n_breaks = n_breaks) +
+    tm_shape(border) +
+    tm_borders(col = "black", lwd = 1.6) +
+    tm_compass_safe() +
+    tm_scalebar_safe() +
+    panel_layout(title)
+}
+
+## ---------------------------------------------------------------------------
+## Print a list of maps three to a page.
+##
+## Each map is printed on its own -- pagination is handled by LaTeX via an
+## explicit \newpage after every third figure, NOT by tmap_arrange(). This is
+## deliberate: tmap_arrange() re-runs component layout across panels and is the
+## suspected source of
+##   Error in if (tail(xright, 1) > W) : missing value where TRUE/FALSE needed
+## Chunk fig-height controls the per-map height (2.9in x 3 fits one page).
+## ---------------------------------------------------------------------------
+print_three_per_page <- function(maps) {
+  for (i in seq_along(maps)) {
+    print(maps[[i]])
+    cat("\n\n")
+    if (i %% 3 == 0 && i < length(maps)) cat("\\newpage\n\n")
+  }
+}
+
+## ---------------------------------------------------------------------------
+## Write a PDF straight into dir_out, 3 maps per page.
+## This does NOT depend on rendering the document -- you can just run the
+## chunks (Run > Run All) and the PDFs appear in outputs/maps.
+## ---------------------------------------------------------------------------
+save_three_per_page <- function(maps, file, width = 7, height = 9.5) {
+  path <- file.path(dir_out, file)
+  grDevices::pdf(path, width = width, height = height, onefile = TRUE)
+  on.exit(grDevices::dev.off(), add = TRUE)
+  groups <- split(maps, ceiling(seq_along(maps) / 3))
+  for (g in groups) print(tmap_arrange(g, nrow = 3, ncol = 1))
+  message("wrote ", path)
+  invisible(path)
+}
+
+## One map, one PDF
+save_one <- function(map, file, width = 7.2, height = 8.4) {
+  path <- file.path(dir_out, file)
+  grDevices::pdf(path, width = width, height = height)
+  on.exit(grDevices::dev.off(), add = TRUE)
+  print(map)
+  message("wrote ", path)
+  invisible(path)
+}
+```
+
+```{r layer-registry}
+#| include: false
+
+## ---------------------------------------------------------------------------
+## LAYER REGISTRY -- one row per map. Add, remove or reorder freely.
+##   file         : filename inside dir_krige
+##   title        : panel heading
+##   legend_title : legend heading (put units here)
+##   pal          : any tmap / viridis / RColorBrewer palette name
+##   band         : layer index for multi-band .tifs
+## ---------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------
+## UNIT CONVERSION -- READ BEFORE CHANGING
+##
+## The files in clipped_and_lbsac are NAMED "_lbsac" but hold ppm. In
+## scp_spatial_prediction_perry_06_30_2026.qmd two blocks write to that folder:
+## the first multiplies by 2 and appends "_lbsac"; the second appends "_lbsac"
+## but writes the clipped raster unconverted, deleting the first block's file
+## on the way. The second block ran last, so the values are ppm.
+##
+## Measured means bear this out (Zn 2.0, Mn 14.5, P 17.4, Ca 376) -- normal
+## Mehlich-1 ppm, far too low for lbs/ac.
+##
+## So we convert on read: lbs/ac = ppm x 2, the standard acre-furrow-slice
+## factor (6-2/3 in depth ~ 2,000,000 lb soil/acre) that UGA AESL uses.
+##
+## *** If you ever fix the source pipeline so the .tifs really are lbs/ac,
+## *** set CONVERT_PPM_TO_LBSAC <- FALSE or the maps will double-count.
+##
+## pH and LBC are NOT converted -- pH is a log scale and LBC is a buffer
+## index. The source script excludes both as well.
+## ---------------------------------------------------------------------------
+CONVERT_PPM_TO_LBSAC <- TRUE
+PPM2 <- if (CONVERT_PPM_TO_LBSAC) 2 else 1
+chem_unit <- if (CONVERT_PPM_TO_LBSAC) "lbs/ac" else "ppm"
+
+## legend_title must stay single-line -- see tm_raster_safe().
+##
+## PAGE BREAKS FOLLOW THIS ORDER: maps are printed in list order and a new page
+## starts after every third one. So entries 1-3 share page 1, 4-6 page 2, etc.
+## To regroup a page, just move entries within this list.
+##
+##   Page 1: Ca, pH, LBC   (the liming set -- read together)
+##   Page 2: K, Mg, Mn
+##   Page 3: P, Zn
+chem_layers <- list(
+  ## -- page 1 --------------------------------------------------------------
+  list(file = "chem_Ca_OK_lbsac.tif",  title = "Calcium (Ca)", mult = PPM2,
+       legend_title = paste0("Ca (", chem_unit, ")"), pal = "brewer.yl_gn_bu"),
+  list(file = "chem_pH.2_OK.tif",      title = "Soil pH",
+       legend_title = "pH",            pal = "brewer.rd_yl_bu"),
+  list(file = "chem_LBC_1_OK.tif",     title = "Lime Buffer Capacity",
+       legend_title = "LBC",           pal = "brewer.pu_bu_gn"),
+  ## -- page 2 --------------------------------------------------------------
+  list(file = "chem_K_OK_lbsac.tif",   title = "Potassium (K)", mult = PPM2,
+       legend_title = paste0("K (", chem_unit, ")"),  pal = "brewer.yl_gn_bu"),
+  list(file = "chem_Mg_OK_lbsac.tif",  title = "Magnesium (Mg)", mult = PPM2,
+       legend_title = paste0("Mg (", chem_unit, ")"), pal = "brewer.yl_gn_bu"),
+  list(file = "chem_Mn_OK_lbsac.tif",  title = "Manganese (Mn)", mult = PPM2,
+       legend_title = paste0("Mn (", chem_unit, ")"), pal = "brewer.yl_or_br"),
+  ## -- page 3 --------------------------------------------------------------
+  list(file = "chem_P_OK_lbsac.tif",   title = "Phosphorus (P)", mult = PPM2,
+       legend_title = paste0("P (", chem_unit, ")"),  pal = "brewer.yl_gn"),
+  list(file = "chem_Zn_OK_lbsac.tif",  title = "Zinc (Zn)", mult = PPM2,
+       legend_title = paste0("Zn (", chem_unit, ")"), pal = "brewer.bu_pu")
+)
+
+## Texture: the normalised 3-band stack sums to 100% across sand/silt/clay.
+## To use the raw lab surfaces instead, swap in texture_lab_sand_OK.tif,
+## texture_lab_silt_OK.tif, texture_lab_clay_OK.tif with band = 1.
+texture_layers <- list(
+  list(file = "texture_OK_normalized_0_100_sum100.tif", band = 1,
+       title = "Sand", legend_title = "Sand (%)", pal = "brewer.yl_or_br"),
+  list(file = "texture_OK_normalized_0_100_sum100.tif", band = 2,
+       title = "Silt", legend_title = "Silt (%)", pal = "brewer.bu_gn"),
+  list(file = "texture_OK_normalized_0_100_sum100.tif", band = 3,
+       title = "Clay", legend_title = "Clay (%)", pal = "brewer.or_rd")
+)
+
+build_maps <- function(spec) {
+  lapply(spec, function(s) {
+    make_raster_map(
+      file         = s$file,
+      title        = s$title,
+      legend_title = s$legend_title,
+      pal          = s$pal,
+      band         = if (is.null(s$band)) 1 else s$band,
+      mult         = if (is.null(s$mult)) 1 else s$mult
+    )
+  })
+}
+```
+
+```{r series-palette}
+#| include: false
+
+## ---------------------------------------------------------------------------
+## Soil series palette, sampled from the ArcGIS Pro legend so the PDF matches
+## the project's existing figures. Unlisted series fall back to a
+## colourblind-safe ramp (see series_palette_for()).
+## ---------------------------------------------------------------------------
+arcgis_series_cols <- c(
+  "Disturbed"   = "#886868",
+  "Benevolence" = "#EEDABA",
+  "Blanton"     = "#B68870",
+  "Dothan"      = "#E6E600",
+  "Faceville"   = "#FF5500",
+  "Greenville"  = "#E64C00",
+  "Johns"       = "#ED7932",
+  "Lakeland"    = "#FFEBAF",
+  "Leefield"    = "#F5B05C",
+  "Lucy"        = "#F57A7A",
+  "Marvyn"      = "#BA7049",
+  "Norfolk"     = "#FFAA00",
+  "Orangeburg"  = "#E69800",
+  "Red Bay"     = "#A83800",
+  "Thursa"      = "#F79965",
+  "Troup"       = "#A87000",
+  ## ArcGIS gave Wagram the same swatch as Lakeland; nudged so the two are
+  ## distinguishable in print. Set to "#FFEBAF" to match ArcGIS exactly.
+  "Wagram"      = "#E8D08A",
+  ## HTM map unit -- the grey that ArcGIS used for the unnamed polygons
+  "HTM"         = "#D9D9D9"
+)
+
+## Okabe-Ito extended -- colourblind-safe fallback for any unmatched class
+cb_safe <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2",
+             "#D55E00", "#CC79A7", "#999999", "#8C510A", "#01665E",
+             "#762A83", "#1B7837", "#B2182B", "#2166AC", "#F1A340",
+             "#998EC3", "#40004B")
+
+series_palette_for <- function(levels_vec) {
+  levels_vec <- levels_vec[!is.na(levels_vec)]
+  pal <- setNames(rep(NA_character_, length(levels_vec)), levels_vec)
+  hit <- levels_vec %in% names(arcgis_series_cols)
+  pal[hit] <- arcgis_series_cols[levels_vec[hit]]
+  n_miss <- sum(!hit)
+  if (n_miss > 0) {
+    pal[!hit] <- rep(cb_safe, length.out = n_miss)[seq_len(n_miss)]
+    message("Series with no ArcGIS colour, using colourblind-safe fallback: ",
+            paste(levels_vec[!hit], collapse = ", "))
+  }
+  pal
+}
+
+## Look for a colour column carried on the shapefile itself before falling
+## back to the ArcGIS-sampled lookup.
+colour_field_in <- function(x) {
+  cand <- grep("^(color|colour|hex|rgb|symbol.*col)", names(x),
+               ignore.case = TRUE, value = TRUE)
+  if (!length(cand)) return(NULL)
+  for (f in cand) {
+    v <- as.character(x[[f]])
+    if (all(grepl("^#?[0-9A-Fa-f]{6}$", v[!is.na(v)]))) return(f)
+  }
+  NULL
+}
+```
+
+\newpage
+
+# Soil Chemistry
+
+```{r chem-maps}
+#| fig-width: 7.0
+#| fig-height: 2.9
+#| results: asis
+
+chem_maps <- build_maps(chem_layers)
+save_three_per_page(chem_maps, "Perry_chemistry_maps.pdf")   # -> outputs/maps
+print_three_per_page(chem_maps)
+```
+
+\newpage
+
+# Particle Size Distribution
+
+Sand, silt and clay from the normalised kriged surfaces (each cell sums to 100%).
+
+```{r texture-maps}
+#| fig-width: 7.0
+#| fig-height: 2.9
+#| results: asis
+
+texture_maps <- build_maps(texture_layers)
+save_three_per_page(texture_maps, "Perry_texture_maps.pdf")  # -> outputs/maps
+print_three_per_page(texture_maps)
+```
+
+\newpage
+
+# Soil Series Map
+
+```{r series-map}
+#| fig-width: 7.2
+#| fig-height: 8.4
+
+series <- sf::st_read(file.path(dir_series, "Soil_Series_Map.shp"), quiet = TRUE)
+series <- sf::st_zm(series, drop = TRUE)
+series <- sf::st_transform(series, TARGET_CRS)          # from GA West State Plane (ft)
+series <- sf::st_make_valid(series)
+
+## Field that carries the series name in this shapefile
+SERIES_FIELD <- "Series_pri"
+series[[SERIES_FIELD]] <- trimws(as.character(series[[SERIES_FIELD]]))
+
+## Polygons with no series name are the HTM map unit. Label them HTM rather
+## than letting tmap render them as a grey "No data" class.
+blank_series <- is.na(series[[SERIES_FIELD]]) | series[[SERIES_FIELD]] == ""
+series[[SERIES_FIELD]][blank_series] <- "HTM"
+
+## HTM is a map unit, not a soil series, so sort it to the bottom of the legend
+lv <- sort(unique(series[[SERIES_FIELD]]))
+lv <- c(setdiff(lv, "HTM"), intersect(lv, "HTM"))
+series[[SERIES_FIELD]] <- factor(series[[SERIES_FIELD]], levels = lv)
+
+## Label points: drops blank/"Unknown" symbols and forces each remaining label
+## inside its own polygon.
+series_lab <- label_points(series, "musym")
+
+cf <- colour_field_in(series)
+if (!is.null(cf)) {
+  lv  <- levels(series[[SERIES_FIELD]])
+  pal <- vapply(lv, function(l) {
+    v <- as.character(series[[cf]][series[[SERIES_FIELD]] == l])[1]
+    if (substr(v, 1, 1) == "#") v else paste0("#", v)
+  }, character(1))
+  message("Using colours from shapefile field: ", cf)
+} else {
+  pal <- series_palette_for(levels(series[[SERIES_FIELD]]))
+}
+
+series_map <- tm_shape(series, bbox = sf::st_bbox(border)) +
+  tm_polys_safe(SERIES_FIELD, pal, "Soil series", legend_ncol = 1) +
+  tm_shape(series_lab) +
+  tm_text_safe("musym", size = 0.38) +
+  tm_shape(border) +
+  tm_borders(col = "black", lwd = 1.8) +
+  tm_compass_safe(size = 2.6) +
+  tm_scalebar_safe() +
+  panel_layout("Mapped Soil Series -- UGA GrandFarm, Perry GA")
+
+save_one(series_map, "Perry_soil_series.pdf")                # -> outputs/maps
+series_map
+```
+
+\newpage
+
+# SSURGO Matchup
+
+Polygons are coloured by whether the field-mapped soil series agrees with the
+SSURGO map unit at that location: green for agreement, orange for disagreement
+(disagreement includes polygons with no SSURGO overlap). Labels are the map
+unit symbols of the soil series actually present at Perry, not SSURGO's.
+Dashed grey lines are SSURGO map unit boundaries; solid black lines are our
+mapped soil series boundaries.
+
+```{r ssurgo-map}
+#| fig-width: 7.2
+#| fig-height: 8.4
+
+ssurgo <- sf::st_read(file.path(dir_series, "SSURGO_matchup.shp"), quiet = TRUE)
+ssurgo <- sf::st_zm(ssurgo, drop = TRUE)
+ssurgo <- sf::st_transform(ssurgo, TARGET_CRS)          # from Web Mercator
+ssurgo <- sf::st_make_valid(ssurgo)
+
+## Collapse to two classes: anything that is not an explicit AGREE -- including
+## NO_OVERLAP and missing values -- counts as Disagree.
+MATCH_FIELD <- "match2"
+raw_match <- toupper(trimws(as.character(ssurgo$match_stat)))
+ssurgo[[MATCH_FIELD]] <- factor(
+  ifelse(!is.na(raw_match) & raw_match == "AGREE", "Agree", "Disagree"),
+  levels = c("Agree", "Disagree")
+)
+
+match_pal <- c(
+  "Agree"    = "#1B7837",   # green
+  "Disagree" = "#E8710A"    # orange
+)
+
+## ---------------------------------------------------------------------------
+## Labels: reuse the EXACT label layer drawn on the soil series map.
+##
+## `series_lab` is already the Perry map unit symbols, one point per polygon,
+## each placed inside its own polygon. Drawing that same object here guarantees
+## the two maps carry identical label text in identical positions -- a spatial
+## join back onto the SSURGO polygons would not, because SSURGO's polygon
+## boundaries differ from ours.
+## ---------------------------------------------------------------------------
+if (!exists("series_lab")) {
+  stop("Run the soil series chunk first -- it creates `series_lab`.")
+}
+ssurgo_lab <- series_lab
+
+## ---------------------------------------------------------------------------
+## Two distinguishable line networks:
+##   dashed grey  = SSURGO map unit boundaries (dissolved on MUKEY)
+##   solid black  = our mapped soil series boundaries (the `series` layer, so
+##                  they are identical to the soil series map)
+## The agreement fill itself is drawn with NO border, otherwise the
+## intersection slivers would add a third set of lines.
+## ---------------------------------------------------------------------------
+ssurgo_units <- dissolve_by(ssurgo, "MUKEY")
+
+ssurgo_map <- tm_shape(ssurgo, bbox = sf::st_bbox(border)) +
+  tm_polys_safe(MATCH_FIELD, match_pal, "SSURGO match", legend_ncol = 1,
+                border_col = NA, border_lwd = 0) +
+  tm_shape(ssurgo_units) +
+  tm_borders(col = "grey15", lwd = 1.0, lty = "dashed") +
+  tm_shape(series) +
+  tm_borders(col = "black", lwd = 0.7, lty = "solid") +
+  tm_shape(ssurgo_lab) +
+  tm_text_safe("musym", size = 0.38) +
+  tm_shape(border) +
+  tm_borders(col = "black", lwd = 1.8) +
+  tm_line_legend_safe(
+    labels = c("SSURGO map unit", "Mapped soil series"),
+    col    = c("grey15", "black"),
+    lty    = c("dashed", "solid"),
+    lwd    = c(1.0, 0.7),
+    title  = "Boundaries"
+  ) +
+  tm_compass_safe(size = 2.6) +
+  tm_scalebar_safe() +
+  panel_layout("Field Series vs. SSURGO Map Unit -- Agreement")
+
+save_one(ssurgo_map, "Perry_ssurgo_matchup.pdf")             # -> outputs/maps
+ssurgo_map
+```
+
+```{r ssurgo-table}
+#| echo: false
+
+tab <- as.data.frame(table(ssurgo[[MATCH_FIELD]]))
+names(tab) <- c("Match status", "Polygons")
+tab$Percent <- sprintf("%.1f%%", 100 * tab$Polygons / sum(tab$Polygons))
+knitr::kable(tab, caption = "SSURGO agreement summary")
+```
+
+\newpage
+
+# Appendix: Layer Inventory
+
+```{r inventory}
+#| echo: false
+
+inv <- do.call(rbind, lapply(c(chem_layers, texture_layers), function(s) {
+  data.frame(
+    Map    = s$title,
+    Source = s$file,
+    Band   = if (is.null(s$band)) 1L else as.integer(s$band),
+    Factor = if (is.null(s$mult)) 1 else s$mult,
+    stringsAsFactors = FALSE
+  )
+}))
+inv <- rbind(
+  inv,
+  data.frame(Map = "Soil series",   Source = "Soil_Series_Map.shp", Band = NA_integer_, Factor = NA_real_),
+  data.frame(Map = "SSURGO matchup", Source = "SSURGO_matchup.shp",  Band = NA_integer_, Factor = NA_real_),
+  data.frame(Map = "Site border",    Source = "border_17N.shp",      Band = NA_integer_, Factor = NA_real_)
+)
+knitr::kable(inv, caption = "Layers rendered in this document")
+```
+
+All maps are projected to **NAD83 / UTM Zone 17N (EPSG:26917)**, the native CRS
+of the kriged surfaces. Scale bars are in metres.
+
+`Factor` is the multiplier applied on read. Ca, K, Mg, Mn, P and Zn are stored
+as Mehlich-1 ppm despite the `_lbsac` filename, and are converted to lbs/ac
+here using the acre-furrow-slice factor of 2. pH and lime buffer capacity are
+not converted.
+
+
+
+```{r Package maps}
+
+## ---------------------------------------------------------------------------
+## Bundles every layer into one zip: GeoTIFF rasters + ESRI shapefiles.
+## Paste anywhere AFTER the `paths` chunk. Re-reads from disk, so chunk order
+## does not matter.   install.packages("zip")  # pure R, no Rtools needed
+## ---------------------------------------------------------------------------
+library(terra); library(sf); library(zip)
+sf::sf_use_s2(FALSE)
+
+INCLUDE_VARIANCE <- TRUE      # also ship the kriging variance surfaces
+TARGET_CRS       <- 26917     # NAD83 / UTM 17N, native CRS of the kriged grids
+
+if (!exists("dir_krige"))   dir_krige   <- "C:/git/spatial_SCP_taxonomy/outputs/perry_ordinary_kriging_no_covars/clipped_and_lbsac"
+if (!exists("dir_series"))  dir_series  <- "C:/git/coastal_plain_taxonomy/outputs/spatial"
+if (!exists("path_border")) path_border <- "C:/Users/Madelyn Willis/OneDrive/Documents/perry_git/perry/Mapping/Data/Border/border_17N.shp"
+if (!exists("dir_out"))     dir_out     <- "C:/git/spatial_SCP_taxonomy/outputs/maps"
+if (!exists("CONVERT_PPM_TO_LBSAC")) CONVERT_PPM_TO_LBSAC <- TRUE
+
+PPM2      <- if (CONVERT_PPM_TO_LBSAC) 2 else 1
+chem_unit <- if (CONVERT_PPM_TO_LBSAC) "lbs/ac" else "ppm"
+
+pkg_name <- paste0("UGA_GrandFarm_Perry_soil_layers_", format(Sys.Date(), "%Y%m%d"))
+pkg_dir  <- file.path(dir_out, pkg_name)
+unlink(pkg_dir, recursive = TRUE)
+dir.create(file.path(pkg_dir, "raster"),    recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(pkg_dir, "shapefile"), recursive = TRUE, showWarnings = FALSE)
+
+## --- raster registry -------------------------------------------------------
+pkg_rasters <- list(
+  list(out="soil_Ca",  file="chem_Ca_OK_lbsac.tif", mult=PPM2, unit=chem_unit, desc="Mehlich-1 extractable calcium"),
+  list(out="soil_pH",  file="chem_pH.2_OK.tif",     mult=1,    unit="pH units", desc="Soil pH, 1:1 soil:water"),
+  list(out="soil_LBC", file="chem_LBC_1_OK.tif",    mult=1,    unit="index",   desc="Lime buffer capacity"),
+  list(out="soil_K",   file="chem_K_OK_lbsac.tif",  mult=PPM2, unit=chem_unit, desc="Mehlich-1 extractable potassium"),
+  list(out="soil_Mg",  file="chem_Mg_OK_lbsac.tif", mult=PPM2, unit=chem_unit, desc="Mehlich-1 extractable magnesium"),
+  list(out="soil_Mn",  file="chem_Mn_OK_lbsac.tif", mult=PPM2, unit=chem_unit, desc="Mehlich-1 extractable manganese"),
+  list(out="soil_P",   file="chem_P_OK_lbsac.tif",  mult=PPM2, unit=chem_unit, desc="Mehlich-1 extractable phosphorus"),
+  list(out="soil_Zn",  file="chem_Zn_OK_lbsac.tif", mult=PPM2, unit=chem_unit, desc="Mehlich-1 extractable zinc"),
+  list(out="texture_sand", file="texture_OK_normalized_0_100_sum100.tif", band=1, mult=1, unit="percent", desc="Sand fraction, normalised to sum 100"),
+  list(out="texture_silt", file="texture_OK_normalized_0_100_sum100.tif", band=2, mult=1, unit="percent", desc="Silt fraction, normalised to sum 100"),
+  list(out="texture_clay", file="texture_OK_normalized_0_100_sum100.tif", band=3, mult=1, unit="percent", desc="Clay fraction, normalised to sum 100")
+)
+
+var_files <- c(soil_Ca="chem_Ca_OKvar.tif", soil_pH="chem_pH.2_OKvar.tif",
+               soil_LBC="chem_LBC_1_OKvar.tif", soil_K="chem_K_OKvar.tif",
+               soil_Mg="chem_Mg_OKvar.tif", soil_Mn="chem_Mn_OKvar.tif",
+               soil_P="chem_P_OKvar.tif", soil_Zn="chem_Zn_OKvar.tif",
+               texture_sand="texture_lab_sand_OKvar.tif",
+               texture_silt="texture_lab_silt_OKvar.tif",
+               texture_clay="texture_lab_clay_OKvar.tif")
+
+meta <- list()
+gtiff <- c("COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER")
+
+for (s in pkg_rasters) {
+  src <- file.path(dir_krige, s$file)
+  if (!file.exists(src)) { message("skipped (missing): ", s$file); next }
+  r <- terra::rast(src)
+  if (!is.null(s$band)) r <- r[[s$band]]
+  if (s$mult != 1) r <- r * s$mult
+  names(r) <- s$out
+  terra::writeRaster(r, file.path(pkg_dir, "raster", paste0(s$out, ".tif")),
+                     overwrite = TRUE, gdal = gtiff, datatype = "FLT4S")
+  v <- terra::values(r, mat = FALSE)
+  meta[[length(meta)+1]] <- data.frame(
+    layer=s$out, type="raster", file=paste0("raster/", s$out, ".tif"),
+    units=s$unit, description=s$desc,
+    min=round(min(v,na.rm=TRUE),3), max=round(max(v,na.rm=TRUE),3),
+    mean=round(mean(v,na.rm=TRUE),3), source=s$file, stringsAsFactors=FALSE)
+  message("raster  ", s$out)
+
+  if (INCLUDE_VARIANCE && s$out %in% names(var_files)) {
+    vsrc <- file.path(dir_krige, var_files[[s$out]])
+    if (file.exists(vsrc)) {
+      rv <- terra::rast(vsrc); names(rv) <- paste0(s$out, "_var")
+      terra::writeRaster(rv, file.path(pkg_dir, "raster", paste0(s$out, "_variance.tif")),
+                         overwrite = TRUE, gdal = gtiff, datatype = "FLT4S")
+      meta[[length(meta)+1]] <- data.frame(
+        layer=paste0(s$out,"_variance"), type="raster",
+        file=paste0("raster/", s$out, "_variance.tif"),
+        units="squared prediction units",
+        description="Ordinary kriging variance (NOT unit-converted)",
+        min=NA_real_, max=NA_real_, mean=NA_real_,
+        source=var_files[[s$out]], stringsAsFactors=FALSE)
+    }
+  }
+}
+
+## --- shapefiles ------------------------------------------------------------
+## Field names are capped at 10 characters and GDAL truncates silently, so all
+## names below are already <= 10 characters.
+write_shp <- function(x, name, desc) {
+  suppressWarnings(
+    sf::st_write(x, file.path(pkg_dir, "shapefile", paste0(name, ".shp")),
+                 quiet = TRUE, delete_dsn = TRUE)
+  )
+  meta[[length(meta)+1]] <<- data.frame(
+    layer=name, type="vector", file=paste0("shapefile/", name, ".shp"),
+    units=NA_character_, description=desc,
+    min=NA_real_, max=NA_real_, mean=NA_real_,
+    source=NA_character_, stringsAsFactors=FALSE)
+  message("vector  ", name, "  (", nrow(x), " features)")
+}
+
+bd <- sf::st_read(path_border, quiet = TRUE)
+bd <- sf::st_zm(sf::st_transform(bd, TARGET_CRS), drop = TRUE)
+write_shp(sf::st_sf(site = "UGA GrandFarm Perry", geometry = sf::st_geometry(bd)),
+          "site_border", "Field boundary of the research site")
+
+se <- sf::st_make_valid(sf::st_zm(sf::st_read(file.path(dir_series, "Soil_Series_Map.shp"), quiet = TRUE), drop = TRUE))
+se <- sf::st_transform(se, TARGET_CRS)
+sp <- trimws(as.character(se$Series_pri)); sp[is.na(sp) | sp == ""] <- "HTM"
+write_shp(sf::st_sf(series = sp,
+                    musym  = trimws(as.character(se$musym)),
+                    muname = trimws(as.character(se$muname)),
+                    geometry = sf::st_geometry(se)),
+          "soil_series", "Soil series mapped in the field, with map unit symbol")
+
+ss <- sf::st_make_valid(sf::st_zm(sf::st_read(file.path(dir_series, "SSURGO_matchup.shp"), quiet = TRUE), drop = TRUE))
+ss <- sf::st_transform(ss, TARGET_CRS)
+raw <- toupper(trimws(as.character(ss$match_stat)))
+ss_out <- sf::st_sf(
+  match      = ifelse(!is.na(raw) & raw == "AGREE", "Agree", "Disagree"),
+  ssgo_musym = trimws(as.character(ss$MUSYM)),
+  ssgo_unit  = trimws(as.character(ss$MapUnit)),
+  ssgo_ser   = trimws(as.character(ss$Series_cle)),
+  fld_series = trimws(as.character(ss$soilseries)),
+  drainage   = trimws(as.character(ss$DrainageCl)),
+  slope      = trimws(as.character(ss$Slope)),
+  geometry   = sf::st_geometry(ss))
+write_shp(ss_out, "ssurgo_matchup",
+          "Field series vs SSURGO map unit; Disagree includes no-overlap polygons")
+
+keys <- ss_out$ssgo_musym; uk <- unique(keys)
+write_shp(sf::st_sf(musym = uk,
+                    geometry = do.call(c, lapply(uk, function(k) sf::st_union(ss_out[keys == k, ]))),
+                    crs = sf::st_crs(ss_out)),
+          "ssurgo_units", "SSURGO map unit polygons, dissolved on map unit symbol")
+
+## --- symbology + metadata --------------------------------------------------
+series_cols <- c(Benevolence="#EEDABA", Blanton="#B68870", Dothan="#E6E600",
+  Faceville="#FF5500", Greenville="#E64C00", Johns="#ED7932", Lakeland="#FFEBAF",
+  Leefield="#F5B05C", Lucy="#F57A7A", Marvyn="#BA7049", Norfolk="#FFAA00",
+  Orangeburg="#E69800", `Red Bay`="#A83800", Thursa="#F79965", Troup="#A87000",
+  Wagram="#E8D08A", Disturbed="#886868", HTM="#D9D9D9")
+rgbm <- grDevices::col2rgb(series_cols)
+utils::write.csv(data.frame(series=names(series_cols), hex=unname(series_cols),
+                            r=rgbm[1,], g=rgbm[2,], b=rgbm[3,]),
+                 file.path(pkg_dir, "soil_series_colors.csv"), row.names = FALSE)
+utils::write.csv(do.call(rbind, meta),
+                 file.path(pkg_dir, "layer_metadata.csv"), row.names = FALSE)
+
+## --- README ----------------------------------------------------------------
+writeLines(c(
+"UGA GRANDFARM - PERRY, GEORGIA",
+"Soil taxonomic and chemical map layers",
+paste0("Packaged ", format(Sys.Date(), "%d %B %Y")),
+"",
+"COORDINATE REFERENCE SYSTEM -------------------------------------------",
+"  All layers: NAD83 / UTM zone 17N (EPSG:26917), metres.",
+"  Rasters are 3 m cell size and share an identical grid.",
+"",
+"CONTENTS ---------------------------------------------------------------",
+"  raster/                 GeoTIFF, LZW compressed, Float32, NoData = NaN",
+"  shapefile/              ESRI shapefiles (.shp/.dbf/.shx/.prj/.cpg)",
+"  layer_metadata.csv      One row per layer: units, description, range",
+"  soil_series_colors.csv  Hex/RGB per series, to match the project figures",
+"",
+"UNITS - PLEASE READ ----------------------------------------------------",
+if (CONVERT_PPM_TO_LBSAC)
+paste0("  Ca, K, Mg, Mn, P and Zn are in lbs/acre, converted from Mehlich-1\n",
+       "  ppm using the acre-furrow-slice factor of 2 (~2,000,000 lb soil per\n",
+       "  acre at 6-2/3 in depth). Rescale if your sampling depth differs.")
+else
+"  Ca, K, Mg, Mn, P and Zn are Mehlich-1 ppm (unconverted).",
+"  pH is unitless and is NOT converted.",
+"  Lime buffer capacity is as measured and is NOT converted.",
+"  Texture layers are percent, normalised so sand+silt+clay = 100.",
+"",
+"METHOD -----------------------------------------------------------------",
+"  Continuous surfaces are ordinary kriging predictions from field sample",
+"  points, no covariates, clipped to the site boundary.",
+"  *_variance.tif is the kriging variance for that surface, in SQUARED",
+"  prediction units and NOT unit-converted, so it is not directly",
+"  comparable with the lbs/acre surfaces.",
+"",
+"  Interpolated surfaces carry uncertainty that grows with distance from",
+"  sample points. Check the variance layers before drawing conclusions",
+"  about any specific location.",
+"",
+"OPENING THE DATA -------------------------------------------------------",
+"  ArcGIS Pro : Add Data, or drag the .tif / .shp in",
+"  QGIS       : drag onto the canvas",
+"  R          : terra::rast() and sf::st_read()",
+"  Python     : rasterio.open() and geopandas.read_file()",
+"",
+"  Shapefile field names are capped at 10 characters. See",
+"  layer_metadata.csv for what each abbreviated field means.",
+"",
+"CONTACT ----------------------------------------------------------------",
+"  Madelyn Willis - Madelyn.Willis@uga.edu",
+"  https://madelynwillis3.github.io/research/"
+), file.path(pkg_dir, "README.txt"))
+
+## --- zip -------------------------------------------------------------------
+zip_path <- file.path(dir_out, paste0(pkg_name, ".zip"))
+if (file.exists(zip_path)) file.remove(zip_path)
+zip::zip(zipfile = zip_path,
+         files   = list.files(pkg_dir, recursive = TRUE),
+         root    = pkg_dir)
+
+cat("\nPackage written:\n  ", zip_path, "\n  ",
+    round(file.size(zip_path)/1024/1024, 2), " MB, ",
+    length(list.files(pkg_dir, recursive = TRUE)), " files\n", sep = "")
+```
+```
+
